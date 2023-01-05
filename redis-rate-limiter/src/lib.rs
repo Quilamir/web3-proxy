@@ -48,7 +48,6 @@ impl RedisRateLimiter {
 
     pub fn now_as_secs(&self) -> f32 {
         // TODO: if system time doesn't match redis, this won't work great
-        // TODO: now that we fixed
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot tell the time")
@@ -109,7 +108,7 @@ impl RedisRateLimiter {
             // do the query
             .query_async(&mut *conn)
             .await
-            .context("increment rate limit and set expiration")?;
+            .context("cannot increment rate limit or set expiration")?;
 
         let new_count: u64 = *x.first().expect("check redis");
 

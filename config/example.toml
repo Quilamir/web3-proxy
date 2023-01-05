@@ -4,7 +4,12 @@ chain_id = 1
 # a database is optional. it is used for user authentication and accounting
 # TODO: how do we find the optimal db_max_connections? too high actually ends up being slower
 db_max_connections = 99
+# development runs cargo commands on the host and so uses "mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy" for db_url
+# production runs inside docker and so uses "mysql://root:web3_proxy@db:3306/web3_proxy" for db_url
 db_url = "mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy"
+
+# read-only replica useful when running the proxy in multiple regions
+db_replica_url = "mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy"
 
 # thundering herd protection
 # only mark a block as the head block if the sum of their soft limits is greater than or equal to min_sum_soft_limit
@@ -15,11 +20,15 @@ min_synced_rpcs = 2
 # redis is optional. it is used for rate limits set by `hard_limit`
 # TODO: how do we find the optimal redis_max_connections? too high actually ends up being slower
 volatile_redis_max_connections = 300
+# development runs cargo commands on the host and so uses "redis://127.0.0.1:16379/" for volatile_redis_url
+# production runs inside docker and so uses "redis://redis:6379/" for volatile_redis_url
 volatile_redis_url = "redis://127.0.0.1:16379/"
 
+# redirect_public_url is optional
 redirect_public_url = "https://llamanodes.com/public-rpc"
-# redirect_rpc_key_url only does something if db_url is set
-redirect_rpc_key_url = "https://llamanodes.com/dashboard/keys?key={rpc_key_id}"
+# redirect_rpc_key_url is optional
+# it only does something if db_url is set
+redirect_rpc_key_url = "https://llamanodes.com/dashboard/keys?key={{rpc_key_id}}"
 
 # sentry is optional. it is used for browsing error logs
 # sentry_url = "https://SENTRY_KEY_A.ingest.sentry.io/SENTRY_KEY_B"
@@ -29,6 +38,7 @@ redirect_rpc_key_url = "https://llamanodes.com/dashboard/keys?key={rpc_key_id}"
 public_max_concurrent_requests = 3
 # 0 = block all public requests
 public_requests_per_period = 200
+login_domain = "llamanodes.com"
 
 # 10GB of cache
 response_cache_max_bytes = 10_000_000_000
@@ -44,50 +54,50 @@ response_cache_max_bytes = 10_000_000_000
     display_name = "Ankr"
     url = "https://rpc.ankr.com/eth"
     soft_limit = 1_000
-    weight = 0
+    tier = 0
 
     [balanced_rpcs.cloudflare]
     display_name = "Cloudflare"
     url = "https://cloudflare-eth.com"
     soft_limit = 1_000
-    weight = 10
+    tier = 1
 
     [balanced_rpcs.blastapi]
     display_name = "Blast"
     url = "https://eth-mainnet.public.blastapi.io"
     soft_limit = 1_000
-    weight = 10
+    tier = 1
 
     [balanced_rpcs.mycryptoapi]
     display_name = "MyCrypto"
     disabled = true
     url = "https://api.mycryptoapi.com/eth"
     soft_limit = 1_000
-    weight = 25
+    tier = 2
 
     [balanced_rpcs.pokt-v1]
     display_name = "Pokt #1"
     url = "https://eth-mainnet.gateway.pokt.network/v1/5f3453978e354ab992c4da79"
     soft_limit = 500
-    weight = 25
+    tier = 2
 
     [balanced_rpcs.pokt]
     display_name = "Pokt #2"
     url = "https://eth-rpc.gateway.pokt.network"
     soft_limit = 500
-    weight = 50
-
-    [balanced_rpcs.runonflux]
-    display_name = "Run on Flux (light)"
-    url = "https://ethereumnodelight.app.runonflux.io"
-    soft_limit = 1_000
-    weight = 75
+    tier = 3
 
     [balanced_rpcs.linkpool]
     display_name = "Linkpool"
     url = "https://main-rpc.linkpool.io"
     soft_limit = 500
-    weight = 75
+    tier = 4
+
+    [balanced_rpcs.runonflux]
+    display_name = "Run on Flux (light)"
+    url = "https://ethereumnodelight.app.runonflux.io"
+    soft_limit = 1_000
+    tier = 5
 
     # load balanced light nodes are not very reliable
     [balanced_rpcs.linkpool-light]
@@ -95,7 +105,7 @@ response_cache_max_bytes = 10_000_000_000
     disabled = true
     url = "https://main-light.eth.linkpool.io"
     soft_limit = 100
-    weight = 75
+    tier = 5
 
 [private_rpcs]
 
@@ -106,32 +116,32 @@ response_cache_max_bytes = 10_000_000_000
     display_name = "Eden network"
     url = "https://api.edennetwork.io/v1/"
     soft_limit = 1_805
-    weight = 0
+    tier = 0
 
     [private_rpcs.eden_beta]
     disabled = true
     display_name = "Eden network beta"
     url = "https://api.edennetwork.io/v1/beta"
     soft_limit = 5_861
-    weight = 0
+    tier = 0
 
     [private_rpcs.ethermine]
     disabled = true
     display_name = "Ethermine"
     url = "https://rpc.ethermine.org"
     soft_limit = 5_861
-    weight = 0
+    tier = 0
 
     [private_rpcs.flashbots]
     disabled = true
     display_name = "Flashbots Fast"
     url = "https://rpc.flashbots.net/fast"
     soft_limit = 7_074
-    weight = 0
+    tier = 0
 
     [private_rpcs.securerpc]
     disabled = true
     display_name = "SecureRPC"
     url = "https://gibson.securerpc.com/v1"
     soft_limit = 4_560
-    weight = 0
+    tier = 0

@@ -70,27 +70,53 @@ $ websocat ws://127.0.0.1:8544
 
 You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and then run `docker-compose up --build -d` start proxies for many chains.
 
+Compare 3 RPCs:
 
-Run migrations (useful during development. in production, the migrations run on application start)
+```
+web3_proxy_cli health_compass https://eth.llamarpc.com https://eth-ski.llamarpc.com https://rpc.ankr.com/eth
+```
+
+### Run migrations
+
+This is only really useful during development. The migrations run on application start.
+
 ```
 cd migration
 cargo run up
 ```
 
-## Database entities
+### Create a user:
 
-This command only needs to be run during development. Production should use the already generated entities.
+```
+web3_proxy_cli --db-url ... create_user --address 0x0000000000000000000000000000000000000000 --email infra@llamanodes.com --description "..."
+```
 
-When developing new database migrations, **after you migrate**, run this command to generate updated entity files. It's best to keep the migration and entity changes in the same commit.
+### Give a user unlimited requests per second:
+
+Copy the ULID key (or UUID key) out of the above command, and put it into the following command.
+
+```
+web3_proxy_cli --db-url ... change_user_tier_by_key "$RPC_ULID_KEY_FROM_PREV_COMMAND" "Unlimited"
+```
+
+### Health compass
+
+Health check 3 servers and error if the first one doesn't match the others.
+
+```
+web3_proxy_cli https://eth.llamarpc.com/ https://rpc.ankr.com/eth https://cloudflare-eth.com
+```
+
+## Adding new database tables
 
 ```
 cargo install sea-orm-cli
 ```
-```
-sea-orm-cli generate entity -u mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy -o entities/src --with-serde both
-```
 
-After running the above, you will need to manually fix some columns: `Vec<u8>` -> `sea_orm::prelude::Uuid` and `i8` -> `bool`. Related: <https://github.com/SeaQL/sea-query/issues/375> <https://github.com/SeaQL/sea-orm/issues/924>
+1. (optional) drop the current dev db
+2. `sea-orm-cli migrate`
+3. `sea-orm-cli generate entity -u mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy -o entities/src --with-serde both`
+4. After running the above, you will need to manually fix some columns: `Vec<u8>` -> `sea_orm::prelude::Uuid` and `i8` -> `bool`. Related: <https://github.com/SeaQL/sea-query/issues/375> <https://github.com/SeaQL/sea-orm/issues/924>
 
 ## Flame Graphs
 
@@ -136,5 +162,7 @@ Test erigon (assuming it is on 8945):
 Note: Testing with `getLatestBlockByNumber.lua` is not great because the latest block changes and so one run is likely to be very different than another.
 
 Run [ethspam](https://github.com/INFURA/versus) and [versus](https://github.com/shazow/ethspam) for a more realistic load test:
+
+    ethspam --rpc http://127.0.0.1:8544 | versus --concurrency=100 --stop-after=10000 http://127.0.0.1:8544
 
     ethspam --rpc http://127.0.0.1:8544/u/$API_KEY | versus --concurrency=100 --stop-after=10000 http://127.0.0.1:8544/u/$API_KEY

@@ -10,21 +10,36 @@ pub mod users;
 
 use crate::app::Web3ProxyApp;
 use axum::{
-    handler::Handler,
     routing::{get, post, put},
     Extension, Router,
 };
 use http::header::AUTHORIZATION;
 use log::info;
-use std::iter::once;
+use moka::future::Cache;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{iter::once, time::Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 
-/// Start the frontend server.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub enum FrontendResponseCaches {
+    Status,
+}
 
+// TODO: what should this cache's value be?
+pub type FrontendResponseCache =
+    Cache<FrontendResponseCaches, Arc<serde_json::Value>, hashbrown::hash_map::DefaultHashBuilder>;
+
+/// Start the frontend server.
 pub async fn serve(port: u16, proxy_app: Arc<Web3ProxyApp>) -> anyhow::Result<()> {
+    // setup caches for whatever the frontend needs
+    // TODO: a moka cache is probably way overkill for this.
+    // no need for max items. only expire because of time to live
+    let response_cache: FrontendResponseCache = Cache::builder()
+        .time_to_live(Duration::from_secs(1))
+        .build_with_hasher(hashbrown::hash_map::DefaultHashBuilder::default());
+
     // build our axum Router
     let app = Router::new()
         // routes should be ordered most to least common
@@ -55,13 +70,15 @@ pub async fn serve(port: u16, proxy_app: Arc<Web3ProxyApp>) -> anyhow::Result<()
         .route("/user/revert_logs", get(users::user_revert_logs_get))
         .route(
             "/user/stats/aggregate",
-            get(users::user_stats_aggregate_get),
+            get(users::user_stats_aggregated_get),
+        )
+        .route(
+            "/user/stats/aggregated",
+            get(users::user_stats_aggregated_get),
         )
         .route("/user/stats/detailed", get(users::user_stats_detailed_get))
         .route("/user/logout", post(users::user_logout_post))
         .route("/status", get(status::status))
-        // TODO: make this optional or remove it since it is available on another port
-        .route("/prometheus", get(status::prometheus))
         // layers are ordered bottom up
         // the last layer is first for requests and last for responses
         // Mark the `Authorization` request header as sensitive so it doesn't show in logs
@@ -70,8 +87,10 @@ pub async fn serve(port: u16, proxy_app: Arc<Web3ProxyApp>) -> anyhow::Result<()
         .layer(CorsLayer::very_permissive())
         // application state
         .layer(Extension(proxy_app.clone()))
+        // frontend caches
+        .layer(Extension(response_cache))
         // 404 for any unknown routes
-        .fallback(errors::handler_404.into_service());
+        .fallback(errors::handler_404);
 
     // run our app with hyper
     // TODO: allow only listening on localhost? top_config.app.host.parse()?

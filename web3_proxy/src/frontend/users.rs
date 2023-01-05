@@ -18,18 +18,20 @@ use axum::{
 };
 use axum_client_ip::ClientIp;
 use axum_macros::debug_handler;
-use entities::{revert_log, rpc_key, user};
+use chrono::{TimeZone, Utc};
+use entities::sea_orm_active_enums::LogLevel;
+use entities::{login, pending_login, revert_log, rpc_key, user};
 use ethers::{prelude::Address, types::Bytes};
 use hashbrown::HashMap;
 use http::{HeaderValue, StatusCode};
 use ipnet::IpNet;
 use itertools::Itertools;
-use log::warn;
+use log::{debug, warn};
+use migration::sea_orm::prelude::Uuid;
 use migration::sea_orm::{
-    self, ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    TransactionTrait, TryIntoModel,
+    self, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+    QueryOrder, TransactionTrait, TryIntoModel,
 };
-use redis_rate_limiter::redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::json;
 use siwe::{Message, VerificationOpts};
@@ -57,7 +59,6 @@ use ulid::Ulid;
 /// It is a better UX to just click "login with ethereum" and have the account created if it doesn't exist.
 /// We can prompt for an email and and payment after they log in.
 #[debug_handler]
-
 pub async fn user_login_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
@@ -83,15 +84,24 @@ pub async fn user_login_get(
         .context("impossible")?
         .parse()
         // TODO: map_err so this becomes a 401
-        .context("bad input")?;
+        .context("unable to parse address")?;
+
+    let login_domain = app
+        .config
+        .login_domain
+        .clone()
+        .unwrap_or_else(|| "llamanodes.com".to_string());
 
     // TODO: get most of these from the app config
     let message = Message {
-        // TODO: should domain be llamanodes, or llamarpc, or the subdomain of llamarpc?
-        domain: "staging.llamanodes.com".parse().unwrap(),
+        // TODO: don't unwrap
+        // TODO: accept a login_domain from the request?
+        domain: login_domain.parse().unwrap(),
         address: user_address.to_fixed_bytes(),
+        // TODO: config for statement
         statement: Some("🦙🦙🦙🦙🦙".to_string()),
-        uri: "https://staging.llamanodes.com/".parse().unwrap(),
+        // TODO: don't unwrap
+        uri: format!("https://{}/", login_domain).parse().unwrap(),
         version: siwe::Version::V1,
         chain_id: 1,
         expiration_time: Some(expiration_time.into()),
@@ -102,16 +112,28 @@ pub async fn user_login_get(
         resources: vec![],
     };
 
-    // TODO: if no redis server, store in local cache? at least give a better error. right now this seems to be a 502
-    // the address isn't enough. we need to save the actual message so we can read the nonce
-    // TODO: what message format is the most efficient to store in redis? probably eip191_bytes
-    // we add 1 to expire_seconds just to be sure redis has the key for the full expiration_time
-    // TODO: store a maximum number of attempted logins? anyone can request so we don't want to allow DOS attacks
-    let session_key = format!("login_nonce:{}", nonce);
-    app.redis_conn()
-        .await?
-        .set_ex(session_key, message.to_string(), expire_seconds + 1)
-        .await?;
+    let db_conn = app.db_conn().context("login requires a database")?;
+
+    // massage types to fit in the database. sea-orm does not make this very elegant
+    let uuid = Uuid::from_u128(nonce.into());
+    // we add 1 to expire_seconds just to be sure the database has the key for the full expiration_time
+    let expires_at = Utc
+        .timestamp_opt(expiration_time.unix_timestamp() + 1, 0)
+        .unwrap();
+
+    // we do not store a maximum number of attempted logins. anyone can request so we don't want to allow DOS attacks
+    // add a row to the database for this user
+    let user_pending_login = pending_login::ActiveModel {
+        id: sea_orm::NotSet,
+        nonce: sea_orm::Set(uuid),
+        message: sea_orm::Set(message.to_string()),
+        expires_at: sea_orm::Set(expires_at),
+    };
+
+    user_pending_login
+        .save(&db_conn)
+        .await
+        .context("saving user's pending_login")?;
 
     // there are multiple ways to sign messages and not all wallets support them
     // TODO: default message eip from config?
@@ -154,12 +176,11 @@ pub struct PostLogin {
 /// It is recommended to save the returned bearer token in a cookie.
 /// The bearer token can be used to authenticate other requests, such as getting the user's stats or modifying the user's profile.
 #[debug_handler]
-
 pub async fn user_login_post(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
-    Json(payload): Json<PostLogin>,
     Query(query): Query<PostLoginQuery>,
+    Json(payload): Json<PostLogin>,
 ) -> FrontendResult {
     login_is_authorized(&app, ip).await?;
 
@@ -191,16 +212,25 @@ pub async fn user_login_post(
 
     // the only part of the message we will trust is their nonce
     // TODO: this is fragile. have a helper function/struct for redis keys
-    let login_nonce_key = format!("login_nonce:{}", &their_msg.nonce);
+    let login_nonce = UserBearerToken::from_str(&their_msg.nonce)?;
 
-    // fetch the message we gave them from our redis
-    let mut redis_conn = app.redis_conn().await?;
+    // fetch the message we gave them from our database
+    let db_replica = app.db_replica().context("Getting database connection")?;
 
-    let our_msg: Option<String> = redis_conn.get(&login_nonce_key).await?;
+    // massage type for the db
+    let login_nonce_uuid: Uuid = login_nonce.clone().into();
 
-    let our_msg: String = our_msg.context("login nonce not found")?;
+    let user_pending_login = pending_login::Entity::find()
+        .filter(pending_login::Column::Nonce.eq(login_nonce_uuid))
+        .one(db_replica.conn())
+        .await
+        .context("database error while finding pending_login")?
+        .context("login nonce not found")?;
 
-    let our_msg: siwe::Message = our_msg.parse().context("parsing siwe message")?;
+    let our_msg: siwe::Message = user_pending_login
+        .message
+        .parse()
+        .context("parsing siwe message")?;
 
     // default options are fine. the message includes timestamp and domain and nonce
     let verify_config = VerificationOpts::default();
@@ -216,6 +246,20 @@ pub async fn user_login_post(
             .verify_eip191(&their_sig)
             .context("verifying eip191 signature against our local message")
         {
+            let db_conn = app
+                .db_conn()
+                .context("deleting expired pending logins requires a db")?;
+
+            // delete ALL expired rows.
+            let now = Utc::now();
+            let delete_result = pending_login::Entity::delete_many()
+                .filter(pending_login::Column::ExpiresAt.lte(now))
+                .exec(&db_conn)
+                .await?;
+
+            // TODO: emit a stat? if this is high something weird might be happening
+            debug!("cleared expired pending_logins: {:?}", delete_result);
+
             return Err(anyhow::anyhow!(
                 "both the primary and eip191 verification failed: {:#?}; {:#?}",
                 err_1,
@@ -225,14 +269,14 @@ pub async fn user_login_post(
         }
     }
 
-    let db_conn = app.db_conn().context("Getting database connection")?;
-
     // TODO: limit columns or load whole user?
     let u = user::Entity::find()
         .filter(user::Column::Address.eq(our_msg.address.as_ref()))
-        .one(&db_conn)
+        .one(db_replica.conn())
         .await
         .unwrap();
+
+    let db_conn = app.db_conn().context("login requires a db")?;
 
     let (u, uks, status_code) = match u {
         None => {
@@ -260,14 +304,12 @@ pub async fn user_login_post(
             let u = u.insert(&txn).await?;
 
             // create the user's first api key
-            // TODO: rename to UserApiKey? RpcApiKey?
             let rpc_secret_key = RpcSecretKey::new();
 
-            // TODO: variable requests per minute depending on the invite code
             let uk = rpc_key::ActiveModel {
                 user_id: sea_orm::Set(u.id),
                 secret_key: sea_orm::Set(rpc_secret_key.into()),
-                description: sea_orm::Set(Some("first".to_string())),
+                description: sea_orm::Set(None),
                 ..Default::default()
             };
 
@@ -287,7 +329,7 @@ pub async fn user_login_post(
             // the user is already registered
             let uks = rpc_key::Entity::find()
                 .filter(rpc_key::Column::UserId.eq(u.id))
-                .all(&db_conn)
+                .all(db_replica.conn())
                 .await
                 .context("failed loading user's key")?;
 
@@ -296,7 +338,7 @@ pub async fn user_login_post(
     };
 
     // create a bearer token for the user.
-    let bearer_token = Ulid::new();
+    let user_bearer_token = UserBearerToken::default();
 
     // json response with everything in it
     // we could return just the bearer token, but I think they will always request api keys and the user profile
@@ -305,27 +347,37 @@ pub async fn user_login_post(
             .into_iter()
             .map(|uk| (uk.id, uk))
             .collect::<HashMap<_, _>>(),
-        "bearer_token": bearer_token,
+        "bearer_token": user_bearer_token,
         "user": u,
     });
 
     let response = (status_code, Json(response_json)).into_response();
 
-    // add bearer to redis
-    // TODO: use a helper function/struct for this
-    let bearer_redis_key = UserBearerToken(bearer_token).to_string();
+    // add bearer to the database
 
     // expire in 4 weeks
-    // TODO: get expiration time from app config
-    redis_conn
-        .set_ex(bearer_redis_key, u.id.to_string(), 2_419_200)
-        .await?;
+    let expires_at = Utc::now()
+        .checked_add_signed(chrono::Duration::weeks(4))
+        .unwrap();
 
-    if let Err(err) = redis_conn.del::<_, u64>(&login_nonce_key).await {
-        warn!(
-            "Failed to delete login_nonce_key {}: {}",
-            login_nonce_key, err
-        );
+    let user_login = login::ActiveModel {
+        id: sea_orm::NotSet,
+        bearer_token: sea_orm::Set(user_bearer_token.uuid()),
+        user_id: sea_orm::Set(u.id),
+        expires_at: sea_orm::Set(expires_at),
+    };
+
+    user_login
+        .save(&db_conn)
+        .await
+        .context("saving user login")?;
+
+    if let Err(err) = user_pending_login
+        .into_active_model()
+        .delete(&db_conn)
+        .await
+    {
+        warn!("Failed to delete nonce:{}: {}", login_nonce.0, err);
     }
 
     Ok(response)
@@ -333,17 +385,39 @@ pub async fn user_login_post(
 
 /// `POST /user/logout` - Forget the bearer token in the `Authentication` header.
 #[debug_handler]
-
 pub async fn user_logout_post(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> FrontendResult {
-    let mut redis_conn = app.redis_conn().await?;
+    let user_bearer = UserBearerToken::try_from(bearer)?;
 
-    // TODO: i don't like this. move this to a helper function so it is less fragile
-    let bearer_cache_key = UserBearerToken::try_from(bearer)?.to_string();
+    let db_conn = app.db_conn().context("database needed for user logout")?;
 
-    redis_conn.del(bearer_cache_key).await?;
+    if let Err(err) = login::Entity::delete_many()
+        .filter(login::Column::BearerToken.eq(user_bearer.uuid()))
+        .exec(&db_conn)
+        .await
+    {
+        debug!("Failed to delete {}: {}", user_bearer.redis_key(), err);
+    }
+
+    let now = Utc::now();
+
+    // also delete any expired logins
+    let delete_result = login::Entity::delete_many()
+        .filter(login::Column::ExpiresAt.lte(now))
+        .exec(&db_conn)
+        .await;
+
+    debug!("Deleted expired logins: {:?}", delete_result);
+
+    // also delete any expired pending logins
+    let delete_result = login::Entity::delete_many()
+        .filter(login::Column::ExpiresAt.lte(now))
+        .exec(&db_conn)
+        .await;
+
+    debug!("Deleted expired pending logins: {:?}", delete_result);
 
     // TODO: what should the response be? probably json something
     Ok("goodbye".into_response())
@@ -355,7 +429,6 @@ pub async fn user_logout_post(
 ///
 /// TODO: this will change as we add better support for secondary users.
 #[debug_handler]
-
 pub async fn user_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer_token)): TypedHeader<Authorization<Bearer>>,
@@ -373,7 +446,6 @@ pub struct UserPost {
 
 /// `POST /user` -- modify the account connected to the bearer token in the `Authentication` header.
 #[debug_handler]
-
 pub async fn user_post(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer_token)): TypedHeader<Authorization<Bearer>>,
@@ -420,7 +492,6 @@ pub async fn user_post(
 /// TODO: one key per request? maybe /user/balance/:rpc_key?
 /// TODO: this will change as we add better support for secondary users.
 #[debug_handler]
-
 pub async fn user_balance_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
@@ -438,7 +509,6 @@ pub async fn user_balance_get(
 /// TODO: one key per request? maybe /user/balance/:rpc_key?
 /// TODO: this will change as we add better support for secondary users.
 #[debug_handler]
-
 pub async fn user_balance_post(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
@@ -452,18 +522,19 @@ pub async fn user_balance_post(
 ///
 /// TODO: one key per request? maybe /user/keys/:rpc_key?
 #[debug_handler]
-
 pub async fn rpc_keys_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> FrontendResult {
     let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
 
-    let db_conn = app.db_conn().context("getting db to fetch user's keys")?;
+    let db_replica = app
+        .db_replica()
+        .context("getting db to fetch user's keys")?;
 
     let uks = rpc_key::Entity::find()
         .filter(rpc_key::Column::UserId.eq(user.id))
-        .all(&db_conn)
+        .all(db_replica.conn())
         .await
         .context("failed loading user's key")?;
 
@@ -481,7 +552,6 @@ pub async fn rpc_keys_get(
 
 /// `DELETE /user/keys` -- Use a bearer token to delete an existing key.
 #[debug_handler]
-
 pub async fn rpc_keys_delete(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
@@ -495,23 +565,24 @@ pub async fn rpc_keys_delete(
 /// the JSON input to the `rpc_keys_management` handler.
 /// If `key_id` is set, it updates an existing key.
 /// If `key_id` is not set, it creates a new key.
+/// `log_request_method` cannot be change once the key is created
+/// `user_tier` cannot be changed here
 #[derive(Debug, Deserialize)]
 pub struct UserKeyManagement {
     key_id: Option<u64>,
-    description: Option<String>,
-    private_txs: Option<bool>,
     active: Option<bool>,
-    // TODO: enable log_revert_trace: Option<f64>,
     allowed_ips: Option<String>,
     allowed_origins: Option<String>,
     allowed_referers: Option<String>,
     allowed_user_agents: Option<String>,
-    // do not allow! `user_tier: Option<u64>,`
+    description: Option<String>,
+    log_level: Option<LogLevel>,
+    // TODO: enable log_revert_trace: Option<f64>,
+    private_txs: Option<bool>,
 }
 
 /// `POST /user/keys` or `PUT /user/keys` -- Use a bearer token to create or update an existing key.
 #[debug_handler]
-
 pub async fn rpc_keys_management(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
@@ -521,27 +592,31 @@ pub async fn rpc_keys_management(
 
     let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
 
-    let db_conn = app.db_conn().context("getting db for user's keys")?;
+    let db_replica = app.db_replica().context("getting db for user's keys")?;
 
     let mut uk = if let Some(existing_key_id) = payload.key_id {
         // get the key and make sure it belongs to the user
-        let uk = rpc_key::Entity::find()
+        rpc_key::Entity::find()
             .filter(rpc_key::Column::UserId.eq(user.id))
             .filter(rpc_key::Column::Id.eq(existing_key_id))
-            .one(&db_conn)
+            .one(db_replica.conn())
             .await
             .context("failed loading user's key")?
-            .context("key does not exist or is not controlled by this bearer token")?;
-
-        uk.try_into().unwrap()
+            .context("key does not exist or is not controlled by this bearer token")?
+            .into_active_model()
     } else {
         // make a new key
         // TODO: limit to 10 keys?
         let secret_key = RpcSecretKey::new();
 
+        let log_level = payload
+            .log_level
+            .context("log level must be 'none', 'detailed', or 'aggregated'")?;
+
         rpc_key::ActiveModel {
             user_id: sea_orm::Set(user.id),
             secret_key: sea_orm::Set(secret_key.into()),
+            log_level: sea_orm::Set(log_level),
             ..Default::default()
         }
     };
@@ -570,7 +645,7 @@ pub async fn rpc_keys_management(
             // split allowed ips on ',' and try to parse them all. error on invalid input
             let allowed_ips = allowed_ips
                 .split(',')
-                .map(|x| x.parse::<IpNet>())
+                .map(|x| x.trim().parse::<IpNet>())
                 .collect::<Result<Vec<_>, _>>()?
                 // parse worked. convert back to Strings
                 .into_iter()
@@ -592,7 +667,7 @@ pub async fn rpc_keys_management(
             // split allowed_origins on ',' and try to parse them all. error on invalid input
             let allowed_origins = allowed_origins
                 .split(',')
-                .map(HeaderValue::from_str)
+                .map(|x| HeaderValue::from_str(x.trim()))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|x| Origin::decode(&mut [x].iter()))
@@ -616,7 +691,7 @@ pub async fn rpc_keys_management(
             // split allowed ips on ',' and try to parse them all. error on invalid input
             let allowed_referers = allowed_referers
                 .split(',')
-                .map(HeaderValue::from_str)
+                .map(|x| HeaderValue::from_str(x.trim()))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|x| Referer::decode(&mut [x].iter()))
@@ -652,7 +727,7 @@ pub async fn rpc_keys_management(
             // split allowed_user_agents on ',' and try to parse them all. error on invalid input
             let allowed_user_agents = allowed_user_agents
                 .split(',')
-                .filter_map(|x| x.parse::<UserAgent>().ok())
+                .filter_map(|x| x.trim().parse::<UserAgent>().ok())
                 // parse worked. convert back to String
                 .map(|x| x.to_string());
 
@@ -665,6 +740,8 @@ pub async fn rpc_keys_management(
     }
 
     let uk = if uk.is_changed() {
+        let db_conn = app.db_conn().context("login requires a db")?;
+
         uk.save(&db_conn).await.context("Failed saving user key")?
     } else {
         uk
@@ -677,7 +754,6 @@ pub async fn rpc_keys_management(
 
 /// `GET /user/revert_logs` -- Use a bearer token to get the user's revert logs.
 #[debug_handler]
-
 pub async fn user_revert_logs_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
@@ -690,7 +766,7 @@ pub async fn user_revert_logs_get(
     let page = get_page_from_params(&params)?;
 
     // TODO: page size from config
-    let page_size = 200;
+    let page_size = 1_000;
 
     let mut response = HashMap::new();
 
@@ -699,32 +775,47 @@ pub async fn user_revert_logs_get(
     response.insert("chain_id", json!(chain_id));
     response.insert("query_start", json!(query_start.timestamp() as u64));
 
-    let db_conn = app.db_conn().context("getting db for user's revert logs")?;
+    let db_replica = app
+        .db_replica()
+        .context("getting replica db for user's revert logs")?;
 
     let uks = rpc_key::Entity::find()
         .filter(rpc_key::Column::UserId.eq(user.id))
-        .all(&db_conn)
+        .all(db_replica.conn())
         .await
         .context("failed loading user's key")?;
 
     // TODO: only select the ids
     let uks: Vec<_> = uks.into_iter().map(|x| x.id).collect();
 
-    // get paginated logs
-    let q = revert_log::Entity::find()
+    // get revert logs
+    let mut q = revert_log::Entity::find()
         .filter(revert_log::Column::Timestamp.gte(query_start))
         .filter(revert_log::Column::RpcKeyId.is_in(uks))
         .order_by_asc(revert_log::Column::Timestamp);
 
-    let q = if chain_id == 0 {
+    if chain_id == 0 {
         // don't do anything
-        q
     } else {
         // filter on chain id
-        q.filter(revert_log::Column::ChainId.eq(chain_id))
-    };
+        q = q.filter(revert_log::Column::ChainId.eq(chain_id))
+    }
 
-    let revert_logs = q.paginate(&db_conn, page_size).fetch_page(page).await?;
+    // query the database for number of items and pages
+    let pages_result = q
+        .clone()
+        .paginate(db_replica.conn(), page_size)
+        .num_items_and_pages()
+        .await?;
+
+    response.insert("num_items", pages_result.number_of_items.into());
+    response.insert("num_pages", pages_result.number_of_pages.into());
+
+    // query the database for the revert logs
+    let revert_logs = q
+        .paginate(db_replica.conn(), page_size)
+        .fetch_page(page)
+        .await?;
 
     response.insert("revert_logs", json!(revert_logs));
 
@@ -733,15 +824,14 @@ pub async fn user_revert_logs_get(
 
 /// `GET /user/stats/aggregate` -- Public endpoint for aggregate stats such as bandwidth used and methods requested.
 #[debug_handler]
-
-pub async fn user_stats_aggregate_get(
+pub async fn user_stats_aggregated_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> FrontendResult {
-    let response = query_user_stats(&app, bearer, &params, StatResponse::Aggregate).await?;
+    let response = query_user_stats(&app, bearer, &params, StatResponse::Aggregated).await?;
 
-    Ok(Json(response).into_response())
+    Ok(response)
 }
 
 /// `GET /user/stats/detailed` -- Use a bearer token to get the user's key stats such as bandwidth used and methods requested.
@@ -754,7 +844,6 @@ pub async fn user_stats_aggregate_get(
 ///
 /// TODO: this will change as we add better support for secondary users.
 #[debug_handler]
-
 pub async fn user_stats_detailed_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -762,5 +851,5 @@ pub async fn user_stats_detailed_get(
 ) -> FrontendResult {
     let response = query_user_stats(&app, bearer, &params, StatResponse::Detailed).await?;
 
-    Ok(Json(response).into_response())
+    Ok(response)
 }

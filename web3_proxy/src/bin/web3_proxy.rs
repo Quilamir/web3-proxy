@@ -8,10 +8,13 @@
 //#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+use anyhow::Context;
 use futures::StreamExt;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
+use num::Zero;
 use parking_lot::deadlock;
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{self, AtomicUsize};
 use std::thread;
 use tokio::runtime;
@@ -32,6 +35,7 @@ fn run(
     let mut shutdown_receiver = shutdown_sender.subscribe();
 
     // spawn a thread for deadlock detection
+    // TODO: disable this feature during release mode and things should go faster
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(10));
         let deadlocks = deadlock::check_deadlock();
@@ -69,12 +73,13 @@ fn run(
     let rt = rt_builder.build()?;
 
     let num_workers = rt.metrics().num_workers();
-    debug!("num_workers: {}", num_workers);
+    info!("num_workers: {}", num_workers);
 
     rt.block_on(async {
         let app_frontend_port = cli_config.port;
         let app_prometheus_port = cli_config.prometheus_port;
 
+        // start the main app
         let mut spawned_app =
             Web3ProxyApp::spawn(top_config, num_workers, shutdown_sender.subscribe()).await?;
 
@@ -87,7 +92,6 @@ fn run(
         ));
 
         // if everything is working, these should both run forever
-        // TODO: join these instead and use shutdown handler properly. probably use tokio's ctrl+c helper
         tokio::select! {
             x = flatten_handles(spawned_app.app_handles) => {
                 match x {
@@ -136,16 +140,29 @@ fn run(
             warn!("shutdown sender err={:?}", err);
         };
 
-        // wait on all the important background tasks (like saving stats to the database) to complete
+        // wait for things like saving stats to the database to complete
+        info!("waiting on important background tasks");
+        let mut background_errors = 0;
         while let Some(x) = spawned_app.background_handles.next().await {
             match x {
-                Err(e) => return Err(e.into()),
-                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    error!("{:?}", e);
+                    background_errors += 1;
+                }
+                Ok(Err(e)) => {
+                    error!("{:?}", e);
+                    background_errors += 1;
+                }
                 Ok(Ok(_)) => continue,
             }
         }
 
-        info!("finished");
+        if background_errors.is_zero() {
+            info!("finished");
+        } else {
+            // TODO: collect instead?
+            error!("finished with errors!")
+        }
 
         Ok(())
     })
@@ -164,9 +181,20 @@ fn main() -> anyhow::Result<()> {
     // initial configuration from flags
     let cli_config: CliConfig = argh::from_env();
 
+    // convert to absolute path so error logging is most helpful
+    let config_path = Path::new(&cli_config.config)
+        .canonicalize()
+        .context(format!(
+            "checking full path of {} and {}",
+            ".", // TODO: get cwd somehow
+            cli_config.config
+        ))?;
+
     // advanced configuration is on disk
-    let top_config: String = fs::read_to_string(cli_config.config.clone())?;
-    let top_config: TopConfig = toml::from_str(&top_config)?;
+    let top_config: String = fs::read_to_string(config_path.clone())
+        .context(format!("reading config at {}", config_path.display()))?;
+    let top_config: TopConfig = toml::from_str(&top_config)
+        .context(format!("parsing config at {}", config_path.display()))?;
 
     // TODO: this doesn't seem to do anything
     proctitle::set_title(format!("web3_proxy-{}", top_config.app.chain_id));
@@ -206,6 +234,7 @@ fn main() -> anyhow::Result<()> {
 
     // tokio has code for catching ctrl+c so we use that
     // this shutdown sender is currently only used in tests, but we might make a /shutdown endpoint or something
+    // we do not need this receiver. new receivers are made by `shutdown_sender.subscribe()`
     let (shutdown_sender, _) = broadcast::channel(1);
 
     run(shutdown_sender, cli_config, top_config)
@@ -214,13 +243,16 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use ethers::{
-        prelude::{Block, Http, Provider, TxHash, U256},
+        prelude::{Http, Provider, U256},
         utils::Anvil,
     };
     use hashbrown::HashMap;
     use std::env;
 
-    use web3_proxy::config::{AppConfig, Web3ConnectionConfig};
+    use web3_proxy::{
+        config::{AppConfig, Web3ConnectionConfig},
+        rpcs::blockchain::ArcBlock,
+    };
 
     use super::*;
 
@@ -244,7 +276,7 @@ mod tests {
         let anvil_provider = Provider::<Http>::try_from(anvil.endpoint()).unwrap();
 
         // mine a block because my code doesn't like being on block 0
-        // TODO: make block 0 okay?
+        // TODO: make block 0 okay? is it okay now?
         let _: U256 = anvil_provider
             .request("evm_mine", None::<()>)
             .await
@@ -259,8 +291,9 @@ mod tests {
             cookie_key_filename: "./does/not/exist/development_cookie_key".to_string(),
         };
 
-        // make a test AppConfig
-        let app_config = TopConfig {
+        // make a test TopConfig
+        // TODO: load TopConfig from a file? CliConfig could have `cli_config.load_top_config`. would need to inject our endpoint ports
+        let top_config = TopConfig {
             app: AppConfig {
                 chain_id: 31337,
                 default_user_max_requests_per_period: Some(6_000_000),
@@ -269,36 +302,41 @@ mod tests {
                 public_requests_per_period: Some(1_000_000),
                 response_cache_max_bytes: 10_usize.pow(7),
                 redirect_public_url: Some("example.com/".to_string()),
-                redirect_rpc_key_url: Some("example.com/{rpc_key_id}".to_string()),
+                redirect_rpc_key_url: Some("example.com/{{rpc_key_id}}".to_string()),
                 ..Default::default()
             },
             balanced_rpcs: HashMap::from([
                 (
                     "anvil".to_string(),
-                    Web3ConnectionConfig::new(
-                        false,
-                        None,
-                        anvil.endpoint(),
-                        100,
-                        None,
-                        1,
-                        Some(false),
-                    ),
+                    Web3ConnectionConfig {
+                        disabled: false,
+                        display_name: None,
+                        url: anvil.endpoint(),
+                        block_data_limit: None,
+                        soft_limit: 100,
+                        hard_limit: None,
+                        tier: 0,
+                        subscribe_txs: Some(false),
+                        extra: Default::default(),
+                    },
                 ),
                 (
                     "anvil_ws".to_string(),
-                    Web3ConnectionConfig::new(
-                        false,
-                        None,
-                        anvil.ws_endpoint(),
-                        100,
-                        None,
-                        0,
-                        Some(true),
-                    ),
+                    Web3ConnectionConfig {
+                        disabled: false,
+                        display_name: None,
+                        url: anvil.ws_endpoint(),
+                        block_data_limit: None,
+                        soft_limit: 100,
+                        hard_limit: None,
+                        tier: 0,
+                        subscribe_txs: Some(false),
+                        extra: Default::default(),
+                    },
                 ),
             ]),
             private_rpcs: None,
+            extra: Default::default(),
         };
 
         let (shutdown_sender, _) = broadcast::channel(1);
@@ -308,19 +346,19 @@ mod tests {
         let handle = {
             let shutdown_sender = shutdown_sender.clone();
 
-            thread::spawn(move || run(shutdown_sender, cli_config, app_config))
+            thread::spawn(move || run(shutdown_sender, cli_config, top_config))
         };
 
         // TODO: do something to the node. query latest block, mine another block, query again
         let proxy_provider = Provider::<Http>::try_from(anvil.endpoint()).unwrap();
 
         let anvil_result = anvil_provider
-            .request::<_, Option<Block<TxHash>>>("eth_getBlockByNumber", ("latest", true))
+            .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", true))
             .await
             .unwrap()
             .unwrap();
         let proxy_result = proxy_provider
-            .request::<_, Option<Block<TxHash>>>("eth_getBlockByNumber", ("latest", true))
+            .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", true))
             .await
             .unwrap()
             .unwrap();
@@ -335,12 +373,12 @@ mod tests {
             .unwrap();
 
         let anvil_result = anvil_provider
-            .request::<_, Option<Block<TxHash>>>("eth_getBlockByNumber", ("latest", true))
+            .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", true))
             .await
             .unwrap()
             .unwrap();
         let proxy_result = proxy_provider
-            .request::<_, Option<Block<TxHash>>>("eth_getBlockByNumber", ("latest", true))
+            .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", true))
             .await
             .unwrap()
             .unwrap();
@@ -349,7 +387,7 @@ mod tests {
 
         let second_block_num = anvil_result.number.unwrap();
 
-        assert_ne!(first_block_num, second_block_num);
+        assert_eq!(first_block_num, second_block_num - 1);
 
         // tell the test app to shut down
         shutdown_sender.send(()).unwrap();

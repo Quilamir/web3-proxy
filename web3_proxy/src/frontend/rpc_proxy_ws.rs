@@ -2,8 +2,14 @@
 //!
 //! WebSockets are the preferred method of receiving requests, but not all clients have good support.
 
-use super::authorization::{ip_is_authorized, key_is_authorized, Authorization};
+use super::authorization::{ip_is_authorized, key_is_authorized, Authorization, RequestMetadata};
 use super::errors::{FrontendErrorResponse, FrontendResult};
+use crate::app::REQUEST_PERIOD;
+use crate::app_stats::ProxyResponseStat;
+use crate::{
+    app::Web3ProxyApp,
+    jsonrpc::{JsonRpcForwardedResponse, JsonRpcForwardedResponseEnum, JsonRpcRequest},
+};
 use axum::headers::{Origin, Referer, UserAgent};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -21,28 +27,20 @@ use futures::{
 use handlebars::Handlebars;
 use hashbrown::HashMap;
 use http::StatusCode;
-use log::{error, info};
-use serde_json::{json, value::RawValue};
+use log::{error, info, trace, warn};
+use serde_json::json;
+use serde_json::value::to_raw_value;
 use std::sync::Arc;
 use std::{str::from_utf8_mut, sync::atomic::AtomicUsize};
 
-use crate::{
-    app::Web3ProxyApp,
-    jsonrpc::{JsonRpcForwardedResponse, JsonRpcForwardedResponseEnum, JsonRpcRequest},
-};
-
 /// Public entrypoint for WebSocket JSON-RPC requests.
-/// Defaults to rate limiting by IP address, but can also read the Authorization header for a bearer token.
 #[debug_handler]
-
 pub async fn websocket_handler(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
     origin: Option<TypedHeader<Origin>>,
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> FrontendResult {
-    // TODO: i don't like logging ips. move this to trace level?
-
     let origin = origin.map(|x| x.0);
 
     let (authorization, _semaphore) = ip_is_authorized(&app, ip, origin).await?;
@@ -56,7 +54,7 @@ pub async fn websocket_handler(
         None => {
             if let Some(redirect) = &app.config.redirect_public_url {
                 // this is not a websocket. redirect to a friendly page
-                Ok(Redirect::to(redirect).into_response())
+                Ok(Redirect::permanent(redirect).into_response())
             } else {
                 // TODO: do not use an anyhow error. send the user a 400
                 Err(
@@ -72,7 +70,6 @@ pub async fn websocket_handler(
 /// Rate limit and billing based on the api key in the url.
 /// Can optionally authorized based on origin, referer, or user agent.
 #[debug_handler]
-
 pub async fn websocket_handler_with_key(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
@@ -94,6 +91,8 @@ pub async fn websocket_handler_with_key(
     )
     .await?;
 
+    trace!("websocket_handler_with_key {:?}", authorization);
+
     let authorization = Arc::new(authorization);
 
     match ws_upgrade {
@@ -102,24 +101,32 @@ pub async fn websocket_handler_with_key(
         }
         None => {
             // if no websocket upgrade, this is probably a user loading the url with their browser
+
+            // TODO: rate limit here? key_is_authorized might be enough
+
             match (
                 &app.config.redirect_public_url,
                 &app.config.redirect_rpc_key_url,
                 authorization.checks.rpc_key_id,
             ) {
-                (None, None, _) => Err(anyhow::anyhow!(
-                    "redirect_rpc_key_url not set. only websockets work here"
-                )
-                .into()),
+                (None, None, _) => Err(FrontendErrorResponse::StatusCode(
+                    StatusCode::BAD_REQUEST,
+                    "this page is for rpcs".to_string(),
+                    None,
+                )),
                 (Some(redirect_public_url), _, None) => {
-                    Ok(Redirect::to(redirect_public_url).into_response())
+                    Ok(Redirect::permanent(redirect_public_url).into_response())
                 }
                 (_, Some(redirect_rpc_key_url), rpc_key_id) => {
                     let reg = Handlebars::new();
 
                     if authorization.checks.rpc_key_id.is_none() {
-                        // TODO: i think this is impossible
-                        Err(anyhow::anyhow!("only authenticated websockets work here").into())
+                        // i don't think this is possible
+                        Err(FrontendErrorResponse::StatusCode(
+                            StatusCode::UNAUTHORIZED,
+                            "AUTHORIZATION header required".to_string(),
+                            None,
+                        ))
                     } else {
                         let redirect_rpc_key_url = reg
                             .render_template(
@@ -129,7 +136,7 @@ pub async fn websocket_handler_with_key(
                             .expect("templating should always work");
 
                         // this is not a websocket. redirect to a page for this user
-                        Ok(Redirect::to(&redirect_rpc_key_url).into_response())
+                        Ok(Redirect::permanent(&redirect_rpc_key_url).into_response())
                     }
                 }
                 // any other combinations get a simple error
@@ -159,7 +166,6 @@ async fn proxy_web3_socket(
 }
 
 /// websockets support a few more methods than http clients
-
 async fn handle_socket_payload(
     app: Arc<Web3ProxyApp>,
     authorization: &Arc<Authorization>,
@@ -171,25 +177,21 @@ async fn handle_socket_payload(
     // TODO: do any clients send batches over websockets?
     let (id, response) = match serde_json::from_str::<JsonRpcRequest>(payload) {
         Ok(json_request) => {
-            // TODO: should we use this id for the subscription id? it should be unique and means we dont need an atomic
             let id = json_request.id.clone();
 
             let response: anyhow::Result<JsonRpcForwardedResponseEnum> = match &json_request.method
                 [..]
             {
                 "eth_subscribe" => {
-                    // TODO: what should go in this span?
-
-                    let response = app
+                    match app
                         .eth_subscribe(
                             authorization.clone(),
                             json_request,
                             subscription_count,
                             response_sender.clone(),
                         )
-                        .await;
-
-                    match response {
+                        .await
+                    {
                         Ok((handle, response)) => {
                             // TODO: better key
                             subscriptions.insert(
@@ -208,10 +210,15 @@ async fn handle_socket_payload(
                     }
                 }
                 "eth_unsubscribe" => {
-                    // TODO: how should handle rate limits and stats on this?
-                    // TODO: handle invalid params
+                    // TODO: move this logic into the app?
+                    let request_bytes = json_request.num_bytes();
+
+                    let request_metadata =
+                        Arc::new(RequestMetadata::new(REQUEST_PERIOD, request_bytes).unwrap());
+
                     let subscription_id = json_request.params.unwrap().to_string();
 
+                    // TODO: is this the right response?
                     let partial_response = match subscriptions.remove(&subscription_id) {
                         None => false,
                         Some(handle) => {
@@ -223,32 +230,58 @@ async fn handle_socket_payload(
                     let response =
                         JsonRpcForwardedResponse::from_value(json!(partial_response), id.clone());
 
+                    if let Some(stat_sender) = app.stat_sender.as_ref() {
+                        let response_stat = ProxyResponseStat::new(
+                            json_request.method.clone(),
+                            authorization.clone(),
+                            request_metadata,
+                            response.num_bytes(),
+                        );
+
+                        if let Err(err) = stat_sender.send_async(response_stat.into()).await {
+                            // TODO: what should we do?
+                            warn!("stat_sender failed during eth_unsubscribe: {:?}", err);
+                        }
+                    }
+
                     Ok(response.into())
                 }
-                _ => {
-                    app.proxy_web3_rpc(authorization.clone(), json_request.into())
-                        .await
-                }
+                _ => app
+                    .proxy_web3_rpc(authorization.clone(), json_request.into())
+                    .await
+                    .map_or_else(
+                        |err| match err {
+                            FrontendErrorResponse::Anyhow(err) => Err(err),
+                            _ => {
+                                error!("handle this better! {:?}", err);
+                                Err(anyhow::anyhow!("unexpected error! {:?}", err))
+                            }
+                        },
+                        |(response, _)| Ok(response),
+                    ),
             };
 
             (id, response)
         }
         Err(err) => {
-            let id = RawValue::from_string("null".to_string()).expect("null can always be a value");
+            // TODO: move this logic somewhere else and just set id to None here
+            let id =
+                to_raw_value(&json!(None::<Option::<()>>)).expect("None can always be a RawValue");
             (id, Err(err.into()))
         }
     };
 
     let response_str = match response {
-        Ok(x) => serde_json::to_string(&x),
+        Ok(x) => serde_json::to_string(&x).expect("to_string should always work here"),
         Err(err) => {
             // we have an anyhow error. turn it into a response
             let response = JsonRpcForwardedResponse::from_anyhow_error(err, None, Some(id));
-            serde_json::to_string(&response)
+
+            serde_json::to_string(&response).expect("to_string should always work here")
         }
-    }
+    };
+
     // TODO: what error should this be?
-    .unwrap();
 
     Message::Text(response_str)
 }
@@ -263,6 +296,7 @@ async fn read_web3_socket(
     let subscription_count = AtomicUsize::new(1);
 
     while let Some(Ok(msg)) = ws_rx.next().await {
+        // TODO: spawn this?
         // new message from our client. forward to a backend and then send it through response_tx
         let response_msg = match msg {
             Message::Text(payload) => {
@@ -276,9 +310,12 @@ async fn read_web3_socket(
                 )
                 .await
             }
-            Message::Ping(x) => Message::Pong(x),
+            Message::Ping(x) => {
+                trace!("ping: {:?}", x);
+                Message::Pong(x)
+            }
             Message::Pong(x) => {
-                // // trace!("pong: {:?}", x);
+                trace!("pong: {:?}", x);
                 continue;
             }
             Message::Close(_) => {
@@ -317,6 +354,7 @@ async fn write_web3_socket(
 ) {
     // TODO: increment counter for open websockets
 
+    // TODO: is there any way to make this stream receive.
     while let Ok(msg) = response_rx.recv_async().await {
         // a response is ready
 
@@ -324,8 +362,8 @@ async fn write_web3_socket(
 
         // forward the response to through the websocket
         if let Err(err) = ws_tx.send(msg).await {
-            // this isn't a problem. this is common and happens whenever a client disconnects
-            // trace!(?err, "unable to write to websocket");
+            // this is common. it happens whenever a client disconnects
+            trace!("unable to write to websocket: {:?}", err);
             break;
         };
     }

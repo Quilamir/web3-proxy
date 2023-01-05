@@ -1,6 +1,6 @@
 [package]
 name = "web3_proxy"
-version = "0.10.0"
+version = "0.12.0"
 edition = "2021"
 default-run = "web3_proxy"
 
@@ -19,26 +19,26 @@ migration = { path = "../migration" }
 redis-rate-limiter = { path = "../redis-rate-limiter" }
 thread-fast-rng = { path = "../thread-fast-rng" }
 
-anyhow = { version = "1.0.66", features = ["backtrace"] }
-arc-swap = "1.5.1"
+anyhow = { version = "1.0.68", features = ["backtrace"] }
+arc-swap = "1.6.0"
 argh = "0.1.9"
-axum = { version = "0.5.17", features = ["headers", "serde_json", "tokio-tungstenite", "ws"] }
-axum-client-ip = "0.2.0"
-axum-macros = "0.2.3"
+axum = { version = "0.6.1", features = ["headers", "ws"] }
+axum-client-ip = "0.3.0"
+axum-macros = "0.3.0"
 # TODO: import chrono from sea-orm so we always have the same version
 chrono = "0.4.23"
 counter = "0.5.7"
 derive_more = "0.99.17"
 dotenv = "0.15.0"
-ethers = { version = "1.0.0", default-features = false, features = ["rustls", "ws"] }
-env_logger = "0.9.3"
+ethers = { version = "1.0.2", default-features = false, features = ["rustls", "ws"] }
+env_logger = "0.10.0"
 fdlimit = "0.2.1"
 flume = "0.10.14"
 futures = { version = "0.3.25", features = ["thread-pool"] }
 hashbrown = { version = "0.13.1", features = ["serde"] }
 hdrhistogram = "7.5.2"
 http = "0.2.8"
-ipnet = "2.5.1"
+ipnet = "2.7.0"
 log = "0.4.17"
 metered = { version = "0.9.0", features = ["serialize"] }
 moka = { version = "0.9.6", default-features = false, features = ["future"] }
@@ -47,27 +47,27 @@ num = "0.4.0"
 # TODO: import num_traits from sea-orm so we always have the same version
 num-traits = "0.2.15"
 parking_lot = { version = "0.12.1", features = ["arc_lock"] }
-petgraph = "0.6.2"
 proctitle = "0.1.1"
 # TODO: regex has several "perf" features that we might want to use
 regex = "1.7.0"
-reqwest = { version = "0.11.12", default-features = false, features = ["json", "tokio-rustls"] }
-handlebars = "4.3.5"
+reqwest = { version = "0.11.13", default-features = false, features = ["json", "tokio-rustls"] }
+handlebars = "4.3.6"
 rustc-hash = "1.1.0"
 siwe = "0.5.0"
-sentry = { version = "0.28.0", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls", "log", "sentry-log"] }
-serde = { version = "1.0.147", features = [] }
-serde_json = { version = "1.0.87", default-features = false, features = ["alloc", "raw_value"] }
+sentry = { version = "0.29.1", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls", "log", "sentry-log"] }
+serde = { version = "1.0.152", features = [] }
+serde_json = { version = "1.0.91", default-features = false, features = ["alloc", "raw_value"] }
 serde_prometheus = "0.1.6"
 # TODO: make sure this time version matches siwe. PR to put this in their prelude
 time = "0.3.17"
-tokio = { version = "1.21.2", features = ["full"] }
+tokio = { version = "1.23.0", features = ["full"] }
 # TODO: make sure this uuid version matches sea-orm. PR to put this in their prelude
 tokio-stream = { version = "0.1.11", features = ["sync"] }
-toml = "0.5.9"
+toml = "0.5.10"
 tower = "0.4.13"
-tower-http = { version = "0.3.4", features = ["cors", "sensitive-headers"] }
+tower-http = { version = "0.3.5", features = ["cors", "sensitive-headers"] }
 ulid = { version = "1.0.0", features = ["serde"] }
 url = "2.3.1"
-uuid = "1.2.1"
+uuid = "1.2.2"
 itertools = "0.10.5"
+glob = "0.3.0"

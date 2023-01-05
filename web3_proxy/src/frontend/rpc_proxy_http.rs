@@ -9,32 +9,46 @@ use axum::TypedHeader;
 use axum::{response::IntoResponse, Extension, Json};
 use axum_client_ip::ClientIp;
 use axum_macros::debug_handler;
+use itertools::Itertools;
 use std::sync::Arc;
 
 /// POST /rpc -- Public entrypoint for HTTP JSON-RPC requests. Web3 wallets use this.
 /// Defaults to rate limiting by IP address, but can also read the Authorization header for a bearer token.
 /// If possible, please use a WebSocket instead.
 #[debug_handler]
-
 pub async fn proxy_web3_rpc(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
     origin: Option<TypedHeader<Origin>>,
     Json(payload): Json<JsonRpcRequestEnum>,
 ) -> FrontendResult {
+    // TODO: benchmark spawning this
     // TODO: do we care about keeping the TypedHeader wrapper?
     let origin = origin.map(|x| x.0);
 
-    let (authorization, _semaphore) = ip_is_authorized(&app, ip, origin).await?;
+    let (authorization, semaphore) = ip_is_authorized(&app, ip, origin).await?;
 
     let authorization = Arc::new(authorization);
 
-    // TODO: spawn earlier? i think we want ip_is_authorized in this future
-    let f = tokio::spawn(async move { app.proxy_web3_rpc(authorization, payload).await });
+    let (response, rpcs, _semaphore) = app
+        .proxy_web3_rpc(authorization, payload)
+        .await
+        .map(|(x, y)| (x, y, semaphore))?;
 
-    let response = f.await.expect("joinhandle should always work")?;
+    let mut response = Json(&response).into_response();
 
-    Ok(Json(&response).into_response())
+    let headers = response.headers_mut();
+
+    // TODO: this might be slow. think about this more
+    // TODO: special string if no rpcs were used (cache hit)?
+    let rpcs: String = rpcs.into_iter().map(|x| x.name.clone()).join(",");
+
+    headers.insert(
+        "W3P-BACKEND-RPCs",
+        rpcs.parse().expect("W3P-BACKEND-RPCS should always parse"),
+    );
+
+    Ok(response)
 }
 
 /// Authenticated entrypoint for HTTP JSON-RPC requests. Web3 wallets use this.
@@ -42,20 +56,20 @@ pub async fn proxy_web3_rpc(
 /// Can optionally authorized based on origin, referer, or user agent.
 /// If possible, please use a WebSocket instead.
 #[debug_handler]
-
 pub async fn proxy_web3_rpc_with_key(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     ClientIp(ip): ClientIp,
-    Json(payload): Json<JsonRpcRequestEnum>,
     origin: Option<TypedHeader<Origin>>,
     referer: Option<TypedHeader<Referer>>,
     user_agent: Option<TypedHeader<UserAgent>>,
     Path(rpc_key): Path<String>,
+    Json(payload): Json<JsonRpcRequestEnum>,
 ) -> FrontendResult {
+    // TODO: DRY w/ proxy_web3_rpc
+    // the request can take a while, so we spawn so that we can start serving another request
     let rpc_key = rpc_key.parse()?;
 
-    // keep the semaphore until the end of the response
-    let (authorization, _semaphore) = key_is_authorized(
+    let (authorization, semaphore) = key_is_authorized(
         &app,
         rpc_key,
         ip,
@@ -67,15 +81,22 @@ pub async fn proxy_web3_rpc_with_key(
 
     let authorization = Arc::new(authorization);
 
-    // the request can take a while, so we spawn so that we can start serving another request
-    // TODO: spawn even earlier?
-    let f = tokio::spawn(async move {
-        app.proxy_web3_rpc(authorization, payload)
-            .await
-    });
+    let (response, rpcs, _semaphore) = app
+        .proxy_web3_rpc(authorization, payload)
+        .await
+        .map(|(x, y)| (x, y, semaphore))?;
 
-    // if this is an error, we are likely shutting down
-    let response = f.await??;
+    let mut response = Json(&response).into_response();
 
-    Ok(Json(&response).into_response())
+    let headers = response.headers_mut();
+
+    // TODO: special string if no rpcs were used (cache hit)? or is an empty string fine? maybe the rpc name + "cached"
+    let rpcs: String = rpcs.into_iter().map(|x| x.name.clone()).join(",");
+
+    headers.insert(
+        "W3P-BACKEND-RPCs",
+        rpcs.parse().expect("W3P-BACKEND-RPCS should always parse"),
+    );
+
+    Ok(response)
 }

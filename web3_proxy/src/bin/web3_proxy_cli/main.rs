@@ -1,10 +1,20 @@
+mod change_user_address;
+mod change_user_address_by_key;
+mod change_user_tier;
+mod change_user_tier_by_address;
+mod change_user_tier_by_key;
 mod check_config;
-mod clear_migration_lock;
+mod cost_calculator;
+mod count_users;
 mod create_user;
-
-use std::fs;
+mod drop_migration_lock;
+mod health_compass;
+mod list_user_tier;
+mod user_export;
+mod user_import;
 
 use argh::FromArgs;
+use std::fs;
 use web3_proxy::{
     app::{get_db, get_migrated_db},
     config::TopConfig,
@@ -32,10 +42,20 @@ pub struct CliConfig {
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand)]
 enum SubCommand {
-    CreateUser(create_user::CreateUserSubCommand),
+    ChangeUserAddress(change_user_address::ChangeUserAddressSubCommand),
+    ChangeUserAddressByKey(change_user_address_by_key::ChangeUserAddressByKeySubCommand),
+    ChangeUserTier(change_user_tier::ChangeUserTierSubCommand),
+    ChangeUserTierByAddress(change_user_tier_by_address::ChangeUserTierByAddressSubCommand),
+    ChangeUserTierByKey(change_user_tier_by_key::ChangeUserTierByKeySubCommand),
     CheckConfig(check_config::CheckConfigSubCommand),
-    DropMigrationLock(clear_migration_lock::DropMigrationLockSubCommand),
-    // TODO: sub command to downgrade migrations?
+    CostCalculator(cost_calculator::CostCalculatorSubCommand),
+    CountUsers(count_users::CountUsersSubCommand),
+    CreateUser(create_user::CreateUserSubCommand),
+    DropMigrationLock(drop_migration_lock::DropMigrationLockSubCommand),
+    HealthCompass(health_compass::HealthCompassSubCommand),
+    UserExport(user_export::UserExportSubCommand),
+    UserImport(user_import::UserImportSubCommand),
+    // TODO: sub command to downgrade migrations? sea-orm has this but doing downgrades here would be easier+safer
     // TODO: sub command to add new api keys to an existing user?
     // TODO: sub command to change a user's tier
 }
@@ -70,14 +90,61 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match cli_config.sub_command {
+        SubCommand::ChangeUserAddress(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::ChangeUserAddressByKey(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::ChangeUserTier(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::ChangeUserTierByAddress(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::ChangeUserTierByKey(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::CheckConfig(x) => x.main().await,
         SubCommand::CreateUser(x) => {
             let db_conn = get_migrated_db(cli_config.db_url, 1, 1).await?;
 
             x.main(&db_conn).await
         }
-        SubCommand::CheckConfig(x) => x.main().await,
-        SubCommand::DropMigrationLock(x) => {
+        SubCommand::CostCalculator(x) => {
             let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::CountUsers(x) => {
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::DropMigrationLock(x) => {
+            // very intentionally, do NOT run migrations here
+            let db_conn = get_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::HealthCompass(x) => x.main().await,
+        SubCommand::UserExport(x) => {
+            let db_conn = get_migrated_db(cli_config.db_url, 1, 1).await?;
+
+            x.main(&db_conn).await
+        }
+        SubCommand::UserImport(x) => {
+            let db_conn = get_migrated_db(cli_config.db_url, 1, 1).await?;
 
             x.main(&db_conn).await
         }

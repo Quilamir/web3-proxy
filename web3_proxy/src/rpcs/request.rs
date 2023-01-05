@@ -1,6 +1,6 @@
 use super::connection::Web3Connection;
 use super::provider::Web3Provider;
-use crate::frontend::authorization::Authorization;
+use crate::frontend::authorization::{Authorization, AuthorizationType};
 use crate::metered::{JsonRpcErrorCount, ProviderErrorCount};
 use anyhow::Context;
 use chrono::Utc;
@@ -8,7 +8,7 @@ use entities::revert_log;
 use entities::sea_orm_active_enums::Method;
 use ethers::providers::{HttpClientError, ProviderError, WsClientError};
 use ethers::types::{Address, Bytes};
-use log::{debug, error, warn, Level};
+use log::{debug, error, trace, warn, Level};
 use metered::metered;
 use metered::HitCount;
 use metered::ResponseTime;
@@ -26,8 +26,8 @@ pub enum OpenRequestResult {
     Handle(OpenRequestHandle),
     /// Unable to start a request. Retry at the given time.
     RetryAt(Instant),
-    /// Unable to start a request. Retrying will not succeed.
-    RetryNever,
+    /// Unable to start a request because the server is not synced
+    NotReady,
 }
 
 /// Make RPC requests through this handle and drop it when you are done.
@@ -37,19 +37,22 @@ pub struct OpenRequestHandle {
     conn: Arc<Web3Connection>,
     // TODO: this is the same metrics on the conn. use a reference?
     metrics: Arc<OpenRequestHandleMetrics>,
+    provider: Arc<Web3Provider>,
     used: AtomicBool,
 }
 
 /// Depending on the context, RPC errors can require different handling.
 pub enum RequestErrorHandler {
-    /// Potentially save the revert. Users can tune how often this happens
-    SaveReverts,
+    /// Log at the trace level. Use when errors are expected.
+    TraceLevel,
     /// Log at the debug level. Use when errors are expected.
     DebugLevel,
     /// Log at the error level. Use when errors are bad.
     ErrorLevel,
     /// Log at the warn level. Use when errors do not cause problems.
     WarnLevel,
+    /// Potentially save the revert. Users can tune how often this happens
+    SaveReverts,
 }
 
 // TODO: second param could be skipped since we don't need it here
@@ -65,6 +68,7 @@ struct EthCallFirstParams {
 impl From<Level> for RequestErrorHandler {
     fn from(level: Level) -> Self {
         match level {
+            Level::Trace => RequestErrorHandler::TraceLevel,
             Level::Debug => RequestErrorHandler::DebugLevel,
             Level::Error => RequestErrorHandler::ErrorLevel,
             Level::Warn => RequestErrorHandler::WarnLevel,
@@ -117,7 +121,7 @@ impl Authorization {
 
         // TODO: what log level?
         // TODO: better format
-        // trace!(?rl);
+        trace!("revert_log: {:?}", rl);
 
         // TODO: return something useful
         Ok(())
@@ -126,7 +130,7 @@ impl Authorization {
 
 #[metered(registry = OpenRequestHandleMetrics, visibility = pub)]
 impl OpenRequestHandle {
-    pub fn new(authorization: Arc<Authorization>, conn: Arc<Web3Connection>) -> Self {
+    pub async fn new(authorization: Arc<Authorization>, conn: Arc<Web3Connection>) -> Self {
         // TODO: take request_id as an argument?
         // TODO: attach a unique id to this? customer requests have one, but not internal queries
         // TODO: what ordering?!
@@ -134,9 +138,50 @@ impl OpenRequestHandle {
         // TODO: these should maybe be sent to an influxdb instance?
         conn.active_requests.fetch_add(1, atomic::Ordering::Relaxed);
 
+        let mut provider = None;
+        let mut logged = false;
+        while provider.is_none() {
+            // trace!("waiting on provider: locking...");
+
+            let ready_provider = conn
+                .provider_state
+                .read()
+                .await
+                // TODO: hard code true, or take a bool in the `new` function?
+                .provider(true)
+                .await
+                .cloned();
+            // trace!("waiting on provider: unlocked!");
+
+            match ready_provider {
+                None => {
+                    if !logged {
+                        logged = true;
+                        warn!("no provider for {}!", conn);
+                    }
+
+                    // TODO: how should this work? a reconnect should be in progress. but maybe force one now?
+                    // TODO: sleep how long? subscribe to something instead? maybe use a watch handle?
+                    // TODO: this is going to be way too verbose!
+                    sleep(Duration::from_millis(100)).await
+                }
+                Some(x) => provider = Some(x),
+            }
+        }
+        let provider = provider.expect("provider was checked already");
+
         // TODO: handle overflows?
         // TODO: what ordering?
-        conn.total_requests.fetch_add(1, atomic::Ordering::Relaxed);
+        match authorization.as_ref().authorization_type {
+            AuthorizationType::Frontend => {
+                conn.frontend_requests
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+            }
+            AuthorizationType::Internal => {
+                conn.internal_requests
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+            }
+        }
 
         let metrics = conn.open_request_handle_metrics.clone();
         let used = false.into();
@@ -145,8 +190,13 @@ impl OpenRequestHandle {
             authorization,
             conn,
             metrics,
+            provider,
             used,
         }
+    }
+
+    pub fn connection_name(&self) -> String {
+        self.conn.name.clone()
     }
 
     #[inline]
@@ -181,42 +231,38 @@ impl OpenRequestHandle {
         // the authorization field is already on a parent span
         // trace!(rpc=%self.conn, %method, "request");
 
-        let mut provider = None;
-
-        while provider.is_none() {
-            match self.conn.provider.read().await.clone() {
-                None => {
-                    warn!("no provider for {}!", self.conn);
-                    // TODO: how should this work? a reconnect should be in progress. but maybe force one now?
-                    // TODO: sleep how long? subscribe to something instead? maybe use a watch handle?
-                    // TODO: this is going to be way too verbose!
-                    sleep(Duration::from_millis(100)).await
-                }
-                Some(found_provider) => provider = Some(found_provider),
-            }
-        }
-
-        let provider = &*provider.expect("provider was checked already");
+        // trace!("got provider for {:?}", self);
 
         // TODO: really sucks that we have to clone here
-        let response = match provider {
+        let response = match &*self.provider {
+            Web3Provider::Mock => unimplemented!(),
             Web3Provider::Http(provider) => provider.request(method, params).await,
             Web3Provider::Ws(provider) => provider.request(method, params).await,
         };
+
+        // TODO: i think ethers already has trace logging (and does it much more fancy)
+        trace!(
+            "response from {} for {} {:?}: {:?}",
+            self.conn,
+            method,
+            params,
+            response,
+        );
 
         if let Err(err) = &response {
             // only save reverts for some types of calls
             // TODO: do something special for eth_sendRawTransaction too
             let error_handler = if let RequestErrorHandler::SaveReverts = error_handler {
+                // TODO: should all these be Trace or Debug or a mix?
                 if !["eth_call", "eth_estimateGas"].contains(&method) {
                     // trace!(%method, "skipping save on revert");
-                    RequestErrorHandler::DebugLevel
+                    RequestErrorHandler::TraceLevel
                 } else if self.authorization.db_conn.is_some() {
                     let log_revert_chance = self.authorization.checks.log_revert_chance;
 
                     if log_revert_chance == 0.0 {
                         // trace!(%method, "no chance. skipping save on revert");
-                        RequestErrorHandler::DebugLevel
+                        RequestErrorHandler::TraceLevel
                     } else if log_revert_chance == 1.0 {
                         // trace!(%method, "gaurenteed chance. SAVING on revert");
                         error_handler
@@ -224,7 +270,7 @@ impl OpenRequestHandle {
                         < log_revert_chance
                     {
                         // trace!(%method, "missed chance. skipping save on revert");
-                        RequestErrorHandler::DebugLevel
+                        RequestErrorHandler::TraceLevel
                     } else {
                         // trace!("Saving on revert");
                         // TODO: is always logging at debug level fine?
@@ -232,7 +278,7 @@ impl OpenRequestHandle {
                     }
                 } else {
                     // trace!(%method, "no database. skipping save on revert");
-                    RequestErrorHandler::DebugLevel
+                    RequestErrorHandler::TraceLevel
                 }
             } else {
                 error_handler
@@ -241,7 +287,8 @@ impl OpenRequestHandle {
             // check for "execution reverted" here
             let is_revert = if let ProviderError::JsonRpcClientError(err) = err {
                 // Http and Ws errors are very similar, but different types
-                let msg = match provider {
+                let msg = match &*self.provider {
+                    Web3Provider::Mock => unimplemented!(),
                     Web3Provider::Http(_) => {
                         if let Some(HttpClientError::JsonRpcError(err)) =
                             err.downcast_ref::<HttpClientError>()
@@ -271,6 +318,11 @@ impl OpenRequestHandle {
                 false
             };
 
+            if is_revert {
+                trace!("revert from {}", self.conn);
+            }
+
+            // TODO: think more about the method and param logs. those can be sensitive information
             match error_handler {
                 RequestErrorHandler::DebugLevel => {
                     // TODO: think about this revert check more. sometimes we might want reverts logged so this needs a flag
@@ -281,19 +333,38 @@ impl OpenRequestHandle {
                         );
                     }
                 }
-                RequestErrorHandler::ErrorLevel => {
-                    error!(
+                RequestErrorHandler::TraceLevel => {
+                    trace!(
                         "bad response from {}! method={} params={:?} err={:?}",
-                        self.conn, method, params, err
+                        self.conn,
+                        method,
+                        params,
+                        err
+                    );
+                }
+                RequestErrorHandler::ErrorLevel => {
+                    // TODO: include params if not running in release mode
+                    error!(
+                        "bad response from {}! method={} err={:?}",
+                        self.conn, method, err
                     );
                 }
                 RequestErrorHandler::WarnLevel => {
+                    // TODO: include params if not running in release mode
                     warn!(
-                        "bad response from {}! method={} params={:?} err={:?}",
-                        self.conn, method, params, err
+                        "bad response from {}! method={} err={:?}",
+                        self.conn, method, err
                     );
                 }
                 RequestErrorHandler::SaveReverts => {
+                    trace!(
+                        "bad response from {}! method={} params={:?} err={:?}",
+                        self.conn,
+                        method,
+                        params,
+                        err
+                    );
+
                     // TODO: do not unwrap! (doesn't matter much since we check method as a string above)
                     let method: Method = Method::try_from_value(&method.to_string()).unwrap();
 
@@ -308,11 +379,6 @@ impl OpenRequestHandle {
                     tokio::spawn(f);
                 }
             }
-        } else {
-            // TODO: i think ethers already has trace logging (and does it much more fancy)
-            // TODO: opt-in response inspection to log reverts with their request. put into redis or what?
-            // // trace!(rpc=%self.conn, %method, ?response);
-            // trace!(%method, rpc=%self.conn, "response");
         }
 
         response

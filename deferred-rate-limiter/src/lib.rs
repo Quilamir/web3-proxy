@@ -34,6 +34,7 @@ where
     K: Copy + Debug + Display + Hash + Eq + Send + Sync + 'static,
 {
     pub fn new(
+        // TODO: change this to cache_size in bytes
         cache_size: u64,
         prefix: &str,
         rrl: RedisRateLimiter,
@@ -42,6 +43,8 @@ where
         let ttl = rrl.period as u64;
 
         // TODO: time to live is not exactly right. we want this ttl counter to start only after redis is down. this works for now
+        // TODO: what do these weigh?
+        // TODO: allow skipping max_capacity
         let local_cache = Cache::builder()
             .time_to_live(Duration::from_secs(ttl))
             .max_capacity(cache_size)
@@ -190,11 +193,14 @@ where
 
                 // if close to max_per_period, wait for redis
                 // TODO: how close should we allow? depends on max expected concurent requests from one user
-                if expected_key_count > max_requests_per_period * 99 / 100 {
+                let limit: f64 = (max_requests_per_period as f64 * 0.99)
+                    .min(max_requests_per_period as f64 - 1.0);
+                if expected_key_count > limit as u64 {
                     // close to period. don't risk it. wait on redis
                     Ok(rate_limit_f.await)
                 } else {
                     // rate limit has enough headroom that it should be safe to do this in the background
+                    // TODO: send an error here somewhere
                     tokio::spawn(rate_limit_f);
 
                     Ok(DeferredRateLimitResult::Allowed)

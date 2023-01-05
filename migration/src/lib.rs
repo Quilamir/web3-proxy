@@ -10,6 +10,8 @@ mod m20221027_002407_user_tiers;
 mod m20221031_211916_clean_up;
 mod m20221101_222349_archive_request;
 mod m20221108_200345_save_anon_stats;
+mod m20221211_124002_request_method_privacy;
+mod m20221213_134158_move_login_into_database;
 
 pub struct Migrator;
 
@@ -27,6 +29,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20221031_211916_clean_up::Migration),
             Box::new(m20221101_222349_archive_request::Migration),
             Box::new(m20221108_200345_save_anon_stats::Migration),
+            Box::new(m20221211_124002_request_method_privacy::Migration),
+            Box::new(m20221213_134158_move_login_into_database::Migration),
         ]
     }
 }

@@ -14,6 +14,7 @@ use log::{debug, warn, Level};
 use moka::future::Cache;
 use serde::Serialize;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp::Ordering, fmt::Display, sync::Arc};
 use tokio::sync::{broadcast, watch};
 use tokio::time::Duration;
@@ -25,20 +26,79 @@ pub type BlockHashesCache = Cache<H256, ArcBlock, hashbrown::hash_map::DefaultHa
 
 /// A block's hash and number.
 #[derive(Clone, Debug, Default, From, Serialize)]
-pub struct BlockId {
-    pub hash: H256,
-    pub num: U64,
+pub struct SavedBlock {
+    pub block: ArcBlock,
+    /// number of seconds this block was behind the current time when received
+    pub age: u64,
 }
 
-impl Display for BlockId {
+impl PartialEq for SavedBlock {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.block.hash, other.block.hash) {
+            (None, None) => true,
+            (Some(_), None) => false,
+            (None, Some(_)) => false,
+            (Some(s), Some(o)) => s == o,
+        }
+    }
+}
+
+impl SavedBlock {
+    pub fn new(block: ArcBlock) -> Self {
+        let mut x = Self { block, age: 0 };
+
+        // no need to recalulate lag every time
+        // if the head block gets too old, a health check restarts this connection
+        x.age = x.lag();
+
+        x
+    }
+
+    pub fn lag(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("there should always be time");
+
+        let block_timestamp = Duration::from_secs(self.block.timestamp.as_u64());
+
+        if block_timestamp < now {
+            // this server is still syncing from too far away to serve requests
+            // u64 is safe because ew checked equality above
+            (now - block_timestamp).as_secs() as u64
+        } else {
+            0
+        }
+    }
+
+    pub fn hash(&self) -> H256 {
+        self.block.hash.expect("saved blocks must have a hash")
+    }
+
+    // TODO: return as U64 or u64?
+    pub fn number(&self) -> U64 {
+        self.block.number.expect("saved blocks must have a number")
+    }
+
+    /// When the block was received, this node was still syncing
+    pub fn syncing(&self, allowed_lag: u64) -> bool {
+        self.age > allowed_lag
+    }
+}
+
+impl From<ArcBlock> for SavedBlock {
+    fn from(x: ArcBlock) -> Self {
+        SavedBlock::new(x)
+    }
+}
+
+impl Display for SavedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.num, self.hash)
+        write!(f, "{} ({}, {}s old)", self.number(), self.hash(), self.age)
     }
 }
 
 impl Web3Connections {
-    /// add a block to our map and it's hash to our graphmap of the blockchain
-
+    /// add a block to our mappings and track the heaviest chain
     pub async fn save_block(&self, block: &ArcBlock, heaviest_chain: bool) -> anyhow::Result<()> {
         // TODO: i think we can rearrange this function to make it faster on the hot path
         let block_hash = block.hash.as_ref().context("no block hash")?;
@@ -49,37 +109,21 @@ impl Web3Connections {
             return Ok(());
         }
 
-        let mut blockchain = self.blockchain_graphmap.write().await;
-
         let block_num = block.number.as_ref().context("no block num")?;
 
         // TODO: think more about heaviest_chain. would be better to do the check inside this function
         if heaviest_chain {
             // this is the only place that writes to block_numbers
-            // its inside a write lock on blockchain_graphmap, so i think there is no race
             // multiple inserts should be okay though
+            // TODO: info that there was a fork?
             self.block_numbers.insert(*block_num, *block_hash).await;
         }
 
-        if blockchain.contains_node(*block_hash) {
-            // // trace!(%block_hash, %block_num, "block already saved");
-            return Ok(());
-        }
-
-        // // trace!(%block_hash, %block_num, "saving new block");
-
-        // TODO: this block is very likely already in block_hashes
+        // this block is very likely already in block_hashes
+        // TODO: use their get_with
         self.block_hashes
-            .insert(*block_hash, block.to_owned())
+            .get_with(*block_hash, async move { block.clone() })
             .await;
-
-        blockchain.add_node(*block_hash);
-
-        // what should edge weight be? and should the nodes be the blocks instead?
-        // we store parent_hash -> hash because the block already stores the parent_hash
-        blockchain.add_edge(block.parent_hash, *block_hash, 0);
-
-        // TODO: prune blockchain to only keep a configurable (256 on ETH?) number of blocks?
 
         Ok(())
     }
@@ -101,17 +145,17 @@ impl Web3Connections {
         // block not in cache. we need to ask an rpc for it
         let get_block_params = (*hash, false);
         // TODO: if error, retry?
-        let block: Block<TxHash> = match rpc {
-            Some(rpc) => {
-                rpc.wait_for_request_handle(authorization, Duration::from_secs(30))
-                    .await?
-                    .request(
-                        "eth_getBlockByHash",
-                        &json!(get_block_params),
-                        Level::Error.into(),
-                    )
-                    .await?
-            }
+        let block: ArcBlock = match rpc {
+            Some(rpc) => rpc
+                .wait_for_request_handle(authorization, Duration::from_secs(30), false)
+                .await?
+                .request::<_, Option<_>>(
+                    "eth_getBlockByHash",
+                    &json!(get_block_params),
+                    Level::Error.into(),
+                )
+                .await?
+                .context("no block!")?,
             None => {
                 // TODO: helper for method+params => JsonRpcRequest
                 // TODO: does this id matter?
@@ -119,17 +163,18 @@ impl Web3Connections {
                 let request: JsonRpcRequest = serde_json::from_value(request)?;
 
                 // TODO: request_metadata? maybe we should put it in the authorization?
+                // TODO: don't hard code allowed lag
                 let response = self
-                    .try_send_best_upstream_server(authorization, request, None, None)
+                    .try_send_best_upstream_server(60, authorization, request, None, None)
                     .await?;
 
-                let block = response.result.unwrap();
+                let block = response.result.context("failed fetching block")?;
 
-                serde_json::from_str(block.get())?
+                let block: Option<ArcBlock> = serde_json::from_str(block.get())?;
+
+                block.context("no block!")?
             }
         };
-
-        let block = Arc::new(block);
 
         // the block was fetched using eth_getBlockByHash, so it should have all fields
         // TODO: fill in heaviest_chain! if the block is old enough, is this definitely true?
@@ -164,7 +209,7 @@ impl Web3Connections {
         // be sure the requested block num exists
         let head_block_num = self.head_block_num().context("no servers in sync")?;
 
-        // TODO: not 64 on all chains? get from config?
+        // TODO: geth does 64, erigon does 90k. sometimes we run a mix
         let archive_needed = num < &(head_block_num - U64::from(64));
 
         if num > &head_block_num {
@@ -196,19 +241,17 @@ impl Web3Connections {
         // TODO: if error, retry?
         // TODO: request_metadata or authorization?
         let response = self
-            .try_send_best_upstream_server(authorization, request, None, Some(num))
+            .try_send_best_upstream_server(60, authorization, request, None, Some(num))
             .await?;
 
         let raw_block = response.result.context("no block result")?;
 
-        let block: Block<TxHash> = serde_json::from_str(raw_block.get())?;
-
-        let block = Arc::new(block);
+        let block: ArcBlock = serde_json::from_str(raw_block.get())?;
 
         // the block was fetched using eth_getBlockByNumber, so it should have all fields and be on the heaviest chain
         self.save_block(&block, true).await?;
 
-        Ok((block, true))
+        Ok((block, archive_needed))
     }
 
     pub(super) async fn process_incoming_blocks(
@@ -225,7 +268,10 @@ impl Web3Connections {
         let mut connection_heads = HashMap::new();
 
         while let Ok((new_block, rpc)) = block_receiver.recv_async().await {
+            let new_block = new_block.map(Into::into);
+
             let rpc_name = rpc.name.clone();
+
             if let Err(err) = self
                 .process_block_from_rpc(
                     authorization,
@@ -248,47 +294,57 @@ impl Web3Connections {
     }
 
     /// `connection_heads` is a mapping of rpc_names to head block hashes.
-    /// self.blockchain_map is a mapping of hashes to the complete Block<TxHash>.
+    /// self.blockchain_map is a mapping of hashes to the complete ArcBlock.
     /// TODO: return something?
-    async fn process_block_from_rpc(
+    pub(crate) async fn process_block_from_rpc(
         &self,
         authorization: &Arc<Authorization>,
         connection_heads: &mut HashMap<String, H256>,
-        rpc_head_block: Option<ArcBlock>,
+        rpc_head_block: Option<SavedBlock>,
         rpc: Arc<Web3Connection>,
         head_block_sender: &watch::Sender<ArcBlock>,
         pending_tx_sender: &Option<broadcast::Sender<TxStatus>>,
     ) -> anyhow::Result<()> {
         // add the rpc's block to connection_heads, or remove the rpc from connection_heads
-        let rpc_head_id = match rpc_head_block {
+        let rpc_head_block = match rpc_head_block {
             Some(rpc_head_block) => {
-                let rpc_head_num = rpc_head_block.number.unwrap();
-                let rpc_head_hash = rpc_head_block.hash.unwrap();
+                // we don't know if its on the heaviest chain yet
+                self.save_block(&rpc_head_block.block, false).await?;
 
-                if rpc_head_num.is_zero() {
-                    // TODO: i don't think we can get to this anymore now that we use Options
-                    debug!("{} still syncing", rpc);
-
-                    connection_heads.remove(&rpc.name);
+                // TODO: don't default to 60. different chains are differen
+                if rpc_head_block.syncing(60) {
+                    if connection_heads.remove(&rpc.name).is_some() {
+                        warn!("{} is behind by {} seconds", &rpc.name, rpc_head_block.age);
+                    } else {
+                        // we didn't remove anything and this block is old. exit early
+                        return Ok(());
+                    };
 
                     None
                 } else {
-                    // we don't know if its on the heaviest chain yet
-                    self.save_block(&rpc_head_block, false).await?;
+                    let rpc_head_hash = rpc_head_block.hash();
 
-                    connection_heads.insert(rpc.name.to_owned(), rpc_head_hash);
+                    if let Some(prev_hash) =
+                        connection_heads.insert(rpc.name.to_owned(), rpc_head_hash)
+                    {
+                        if prev_hash == rpc_head_hash {
+                            // this block was already sent by this node. return early
+                            return Ok(());
+                        }
+                    }
 
-                    Some(BlockId {
-                        hash: rpc_head_hash,
-                        num: rpc_head_num,
-                    })
+                    // TODO: should we just keep the ArcBlock here?
+                    Some(rpc_head_block)
                 }
             }
             None => {
-                // TODO: warn is too verbose. this is expected if a node disconnects and has to reconnect
                 // // trace!(%rpc, "Block without number or hash!");
 
-                connection_heads.remove(&rpc.name);
+                if connection_heads.remove(&rpc.name).is_none() {
+                    // this connection was already removed.
+                    // return early. no need to process synced connections
+                    return Ok(());
+                }
 
                 None
             }
@@ -388,7 +444,7 @@ impl Web3Connections {
                 }
 
                 if highest_rpcs_sum_soft_limit < self.min_sum_soft_limit
-                    || highest_rpcs.len() < self.min_synced_rpcs
+                    || highest_rpcs.len() < self.min_head_rpcs
                 {
                     // not enough rpcs yet. check the parent
                     if let Some(parent_block) = self.block_hashes.get(&maybe_head_block.parent_hash)
@@ -400,12 +456,13 @@ impl Web3Connections {
                         maybe_head_block = parent_block;
                         continue;
                     } else {
+                        // TODO: this message
                         warn!(
-                            "no parent to check. soft limit only {}/{} from {}/{} rpcs: {}%",
+                            "soft limit {}/{} from {}/{} rpcs: {}%",
                             highest_rpcs_sum_soft_limit,
                             self.min_sum_soft_limit,
                             highest_rpcs.len(),
-                            self.min_synced_rpcs,
+                            self.min_head_rpcs,
                             highest_rpcs_sum_soft_limit * 100 / self.min_sum_soft_limit
                         );
                         break;
@@ -443,26 +500,20 @@ impl Web3Connections {
                     .filter_map(|conn_name| self.conns.get(conn_name).cloned())
                     .collect();
 
-                let consensus_head_block = maybe_head_block;
-
-                let consensus_head_hash = consensus_head_block
+                // TODO: DEBUG only check
+                let _ = maybe_head_block
                     .hash
                     .expect("head blocks always have hashes");
-                let consensus_head_num = consensus_head_block
+                let _ = maybe_head_block
                     .number
                     .expect("head blocks always have numbers");
 
-                debug_assert_ne!(consensus_head_num, U64::zero());
-
                 let num_consensus_rpcs = conns.len();
 
-                let consensus_head_block_id = BlockId {
-                    hash: consensus_head_hash,
-                    num: consensus_head_num,
-                };
+                let consensus_head_block: SavedBlock = maybe_head_block.into();
 
                 let new_synced_connections = SyncedConnections {
-                    head_block_id: Some(consensus_head_block_id.clone()),
+                    head_block: Some(consensus_head_block.clone()),
                     conns,
                 };
 
@@ -471,44 +522,44 @@ impl Web3Connections {
                     .swap(Arc::new(new_synced_connections));
 
                 // TODO: if the rpc_head_block != consensus_head_block, log something?
-                match &old_synced_connections.head_block_id {
+                match &old_synced_connections.head_block {
                     None => {
                         debug!(
                             "first {}/{}/{} block={}, rpc={}",
                             num_consensus_rpcs,
                             num_connection_heads,
                             total_conns,
-                            consensus_head_block_id,
+                            consensus_head_block,
                             rpc
                         );
 
-                        self.save_block(&consensus_head_block, true).await?;
+                        self.save_block(&consensus_head_block.block, true).await?;
 
                         head_block_sender
-                            .send(consensus_head_block)
+                            .send(consensus_head_block.block)
                             .context("head_block_sender sending consensus_head_block")?;
                     }
-                    Some(old_block_id) => {
+                    Some(old_head_block) => {
                         // TODO: do this log item better
-                        let rpc_head_str = rpc_head_id
+                        let rpc_head_str = rpc_head_block
                             .map(|x| x.to_string())
                             .unwrap_or_else(|| "None".to_string());
 
-                        match consensus_head_block_id.num.cmp(&old_block_id.num) {
+                        match consensus_head_block.number().cmp(&old_head_block.number()) {
                             Ordering::Equal => {
-                                // TODO: if rpc_block_id != consensus_head_block_id, do a different log?
+                                // TODO: if rpc_block_id != consensus_head_block, do a different log?
 
                                 // multiple blocks with the same fork!
-                                if consensus_head_block_id.hash == old_block_id.hash {
+                                if consensus_head_block.hash() == old_head_block.hash() {
                                     // no change in hash. no need to use head_block_sender
                                     debug!(
-                                        "con {}/{}/{} con_head={} rpc={} rpc_head={}",
+                                        "con {}/{}/{} con_head={} rpc_head={} rpc={}",
                                         num_consensus_rpcs,
                                         num_connection_heads,
                                         total_conns,
-                                        consensus_head_block_id,
+                                        consensus_head_block,
+                                        rpc_head_str,
                                         rpc,
-                                        rpc_head_str
                                     )
                                 } else {
                                     // hash changed
@@ -517,17 +568,17 @@ impl Web3Connections {
                                         num_consensus_rpcs,
                                         num_connection_heads,
                                         total_conns,
-                                        consensus_head_block_id,
-                                        old_block_id,
+                                        consensus_head_block,
+                                        old_head_block,
                                         rpc_head_str,
-                                        rpc
+                                        rpc,
                                     );
 
-                                    self.save_block(&consensus_head_block, true)
+                                    self.save_block(&consensus_head_block.block, true)
                                         .await
                                         .context("save consensus_head_block as heaviest chain")?;
 
-                                    head_block_sender.send(consensus_head_block).context(
+                                    head_block_sender.send(consensus_head_block.block).context(
                                         "head_block_sender sending consensus_head_block",
                                     )?;
                                 }
@@ -535,31 +586,33 @@ impl Web3Connections {
                             Ordering::Less => {
                                 // this is unlikely but possible
                                 // TODO: better log
-                                warn!("chain rolled back {}/{}/{} con_head={} old_head={} rpc_head={} rpc={}", num_consensus_rpcs, num_connection_heads, total_conns, consensus_head_block_id, old_block_id, rpc_head_str, rpc);
+                                warn!("chain rolled back {}/{}/{} con_head={} old_head={} rpc_head={} rpc={}", num_consensus_rpcs, num_connection_heads, total_conns, consensus_head_block, old_head_block, rpc_head_str, rpc);
 
                                 // TODO: tell save_block to remove any higher block numbers from the cache. not needed because we have other checks on requested blocks being > head, but still seems slike a good idea
-                                self.save_block(&consensus_head_block, true).await.context(
-                                    "save_block sending consensus_head_block as heaviest chain",
-                                )?;
+                                self.save_block(&consensus_head_block.block, true)
+                                    .await
+                                    .context(
+                                        "save_block sending consensus_head_block as heaviest chain",
+                                    )?;
 
                                 head_block_sender
-                                    .send(consensus_head_block)
+                                    .send(consensus_head_block.block)
                                     .context("head_block_sender sending consensus_head_block")?;
                             }
                             Ordering::Greater => {
                                 debug!(
-                                    "new {}/{}/{} con head={} rpc_head={} rpc={}",
+                                    "new {}/{}/{} con_head={} rpc_head={} rpc={}",
                                     num_consensus_rpcs,
                                     num_connection_heads,
                                     total_conns,
-                                    consensus_head_block_id,
+                                    consensus_head_block,
                                     rpc_head_str,
                                     rpc
                                 );
 
-                                self.save_block(&consensus_head_block, true).await?;
+                                self.save_block(&consensus_head_block.block, true).await?;
 
-                                head_block_sender.send(consensus_head_block)?;
+                                head_block_sender.send(consensus_head_block.block)?;
                             }
                         }
                     }

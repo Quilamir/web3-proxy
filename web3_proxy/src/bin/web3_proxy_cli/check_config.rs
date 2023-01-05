@@ -4,7 +4,7 @@ use std::fs;
 use web3_proxy::config::TopConfig;
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
-/// Second subcommand.
+/// Check the config for any problems.
 #[argh(subcommand, name = "check_config")]
 pub struct CheckConfigSubCommand {
     #[argh(positional)]
@@ -70,12 +70,12 @@ impl CheckConfigSubCommand {
         // TODO: also check that it contains rpc_key_id!
         match top_config.app.redirect_rpc_key_url {
             None => {
-                warn!("app.redirect_user_url is None. Registered users will get an error page instead of a redirect")
+                warn!("app.redirect_rpc_key_url is None. Registered users will get an error page instead of a redirect")
             }
             Some(x) => {
-                if !x.contains("{rpc_key_id}") {
+                if !x.contains("{{rpc_key_id}}") {
                     num_errors += 1;
-                    error!("redirect_user_url user url must contain \"{{rpc_key_id}}\"")
+                    error!("redirect_rpc_key_url user url must contain \"{{rpc_key_id}}\"")
                 }
             }
         }
@@ -85,10 +85,7 @@ impl CheckConfigSubCommand {
         if num_errors == 0 {
             Ok(())
         } else {
-            Err(anyhow::anyhow!(format!(
-                "there were {} errors!",
-                num_errors
-            )))
+            Err(anyhow::anyhow!("there were {} errors!", num_errors))
         }
     }
 }

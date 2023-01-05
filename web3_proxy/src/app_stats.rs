@@ -1,9 +1,9 @@
 use crate::frontend::authorization::{Authorization, RequestMetadata};
-use crate::jsonrpc::JsonRpcForwardedResponse;
 use axum::headers::Origin;
 use chrono::{TimeZone, Utc};
 use derive_more::From;
 use entities::rpc_accounting;
+use entities::sea_orm_active_enums::LogLevel;
 use hashbrown::HashMap;
 use hdrhistogram::{Histogram, RecordError};
 use log::{error, info};
@@ -35,7 +35,7 @@ impl ProxyResponseStat {
     /// TODO: think more about this. probably rename it
     fn key(&self) -> ProxyResponseAggregateKey {
         // include either the rpc_key_id or the origin
-        let (rpc_key_id, origin) = match (
+        let (mut rpc_key_id, origin) = match (
             self.authorization.checks.rpc_key_id,
             &self.authorization.origin,
         ) {
@@ -53,10 +53,27 @@ impl ProxyResponseStat {
             }
         };
 
+        let method = match self.authorization.checks.log_level {
+            LogLevel::None => {
+                // No rpc_key logging. Only save fully anonymized metric
+                rpc_key_id = None;
+                // keep the method since the rpc key is not attached
+                Some(self.method.clone())
+            }
+            LogLevel::Aggregated => {
+                // Lose the method
+                None
+            }
+            LogLevel::Detailed => {
+                // include the method
+                Some(self.method.clone())
+            }
+        };
+
         ProxyResponseAggregateKey {
             archive_request: self.archive_request,
             error_response: self.error_response,
-            method: self.method.clone(),
+            method,
             origin,
             rpc_key_id,
         }
@@ -90,7 +107,7 @@ struct ProxyResponseAggregateKey {
     archive_request: bool,
     error_response: bool,
     rpc_key_id: Option<NonZeroU64>,
-    method: String,
+    method: Option<String>,
     /// TODO: should this be Origin or String?
     origin: Option<Origin>,
 }
@@ -251,20 +268,14 @@ impl ProxyResponseAggregate {
 }
 
 impl ProxyResponseStat {
-    // TODO: should RequestMetadata be in an arc? or can we handle refs here?
     pub fn new(
         method: String,
         authorization: Arc<Authorization>,
         metadata: Arc<RequestMetadata>,
-        response: &JsonRpcForwardedResponse,
+        response_bytes: usize,
     ) -> Self {
-        // TODO: do this without serializing to a string. this is going to slow us down!
-        let response_bytes = serde_json::to_string(response)
-            .expect("serializing here should always work")
-            .len() as u64;
-
         let archive_request = metadata.archive_request.load(Ordering::Acquire);
-        let backend_requests = metadata.backend_requests.load(Ordering::Acquire);
+        let backend_requests = metadata.backend_requests.lock().len() as u64;
         // let period_seconds = metadata.period_seconds;
         // let period_timestamp =
         //     (metadata.start_datetime.timestamp() as u64) / period_seconds * period_seconds;
@@ -273,6 +284,8 @@ impl ProxyResponseStat {
 
         // TODO: timestamps could get confused by leap seconds. need tokio time instead
         let response_millis = metadata.start_instant.elapsed().as_millis() as u64;
+
+        let response_bytes = response_bytes as u64;
 
         Self {
             authorization,
@@ -302,6 +315,7 @@ impl StatEmitter {
             period_seconds,
         };
 
+        // TODO: send any errors somewhere
         let handle =
             tokio::spawn(async move { new.stat_loop(stat_receiver, shutdown_receiver).await });
 

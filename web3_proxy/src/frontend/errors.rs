@@ -11,12 +11,11 @@ use axum::{
 use derive_more::From;
 use http::header::InvalidHeaderValue;
 use ipnet::AddrParseError;
-use log::warn;
+use log::{trace, warn};
 use migration::sea_orm::DbErr;
 use redis_rate_limiter::redis::RedisError;
 use reqwest::header::ToStrError;
-use std::error::Error;
-use tokio::{task::JoinError, time::Instant};
+use tokio::{sync::AcquireError, task::JoinError, time::Instant};
 
 // TODO: take "IntoResponse" instead of Response?
 pub type FrontendResult = Result<Response, FrontendErrorResponse>;
@@ -24,8 +23,9 @@ pub type FrontendResult = Result<Response, FrontendErrorResponse>;
 // TODO:
 #[derive(Debug, From)]
 pub enum FrontendErrorResponse {
+    AccessDenied,
     Anyhow(anyhow::Error),
-    Box(Box<dyn Error>),
+    SemaphoreAcquireError(AcquireError),
     Database(DbErr),
     HeadersError(headers::Error),
     HeaderToString(ToStrError),
@@ -38,6 +38,8 @@ pub enum FrontendErrorResponse {
     Response(Response),
     /// simple way to return an error message to the user and an anyhow to our logs
     StatusCode(StatusCode, String, Option<anyhow::Error>),
+    /// TODO: what should be attached to the timout?
+    Timeout(tokio::time::error::Elapsed),
     UlidDecodeError(ulid::DecodeError),
     UnknownKey,
 }
@@ -45,7 +47,21 @@ pub enum FrontendErrorResponse {
 impl IntoResponse for FrontendErrorResponse {
     fn into_response(self) -> Response {
         // TODO: include the request id in these so that users can give us something that will point to logs
+        // TODO: status code is in the jsonrpc response and is also the first item in the tuple. DRY
         let (status_code, response) = match self {
+            Self::AccessDenied => {
+                // TODO: attach something to this trace. probably don't include much in the message though. don't want to leak creds by accident
+                trace!("access denied");
+                (
+                    StatusCode::FORBIDDEN,
+                    JsonRpcForwardedResponse::from_string(
+                        // TODO: is it safe to expose all of our anyhow strings?
+                        "FORBIDDEN".to_string(),
+                        Some(StatusCode::FORBIDDEN.as_u16().into()),
+                        None,
+                    ),
+                )
+            }
             Self::Anyhow(err) => {
                 warn!("anyhow. err={:?}", err);
                 (
@@ -58,18 +74,18 @@ impl IntoResponse for FrontendErrorResponse {
                     ),
                 )
             }
-            Self::Box(err) => {
-                warn!("boxed err={:?}", err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonRpcForwardedResponse::from_str(
-                        // TODO: make this better. maybe include the error type?
-                        "boxed error!",
-                        Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16().into()),
-                        None,
-                    ),
-                )
-            }
+            // Self::(err) => {
+            //     warn!("boxed err={:?}", err);
+            //     (
+            //         StatusCode::INTERNAL_SERVER_ERROR,
+            //         JsonRpcForwardedResponse::from_str(
+            //             // TODO: make this better. maybe include the error type?
+            //             "boxed error!",
+            //             Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16().into()),
+            //             None,
+            //         ),
+            //     )
+            // }
             Self::Database(err) => {
                 warn!("database err={:?}", err);
                 (
@@ -115,12 +131,20 @@ impl IntoResponse for FrontendErrorResponse {
                 )
             }
             Self::JoinError(err) => {
-                warn!("JoinError. likely shutting down. err={:?}", err);
+                let code = if err.is_cancelled() {
+                    trace!("JoinError. likely shutting down. err={:?}", err);
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    warn!("JoinError. err={:?}", err);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+
                 (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    code,
                     JsonRpcForwardedResponse::from_str(
+                        // TODO: different messages, too?
                         "Unable to complete request",
-                        Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16().into()),
+                        Some(code.as_u16().into()),
                         None,
                     ),
                 )
@@ -184,20 +208,43 @@ impl IntoResponse for FrontendErrorResponse {
                 debug_assert_ne!(r.status(), StatusCode::OK);
                 return r;
             }
-            Self::StatusCode(status_code, err_msg, err) => {
-                // TODO: warn is way too loud. different status codes should get different error levels. 500s should warn. 400s should stat
-                // trace!(?status_code, ?err_msg, ?err);
+            Self::SemaphoreAcquireError(err) => {
+                warn!("semaphore acquire err={:?}", err);
                 (
-                    status_code,
-                    JsonRpcForwardedResponse::from_str(
-                        &err_msg,
-                        Some(status_code.as_u16().into()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonRpcForwardedResponse::from_string(
+                        // TODO: is it safe to expose all of our anyhow strings?
+                        "semaphore acquire error".to_string(),
+                        Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16().into()),
                         None,
                     ),
                 )
             }
+            Self::StatusCode(status_code, err_msg, err) => {
+                // different status codes should get different error levels. 500s should warn. 400s should stat
+                let code = status_code.as_u16();
+                if (500..600).contains(&code) {
+                    warn!("server error {} {:?}: {:?}", code, err_msg, err);
+                } else {
+                    trace!("user error {} {:?}: {:?}", code, err_msg, err);
+                }
+
+                (
+                    status_code,
+                    JsonRpcForwardedResponse::from_str(&err_msg, Some(code.into()), None),
+                )
+            }
+            Self::Timeout(x) => (
+                StatusCode::REQUEST_TIMEOUT,
+                JsonRpcForwardedResponse::from_str(
+                    &format!("request timed out: {:?}", x),
+                    Some(StatusCode::REQUEST_TIMEOUT.as_u16().into()),
+                    // TODO: include the actual id!
+                    None,
+                ),
+            ),
             Self::HeaderToString(err) => {
-                // // trace!(?err, "HeaderToString");
+                // trace!(?err, "HeaderToString");
                 (
                     StatusCode::BAD_REQUEST,
                     JsonRpcForwardedResponse::from_str(
@@ -208,7 +255,7 @@ impl IntoResponse for FrontendErrorResponse {
                 )
             }
             Self::UlidDecodeError(err) => {
-                // // trace!(?err, "UlidDecodeError");
+                // trace!(?err, "UlidDecodeError");
                 (
                     StatusCode::BAD_REQUEST,
                     JsonRpcForwardedResponse::from_str(
